@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建中间目录
+bld/
+bld_*/
+bld_tmp/
+chkb/
+*.spec.bak
+
+# 依赖 / 分块下载缓存
+pipcache/
+pymupdf.whl.parts/
+.pybuild_cache/
+
+# 测试产物
+download_test*.pdf
+chunk_*
+
+# 本地记忆（不发布）
+.workbuddy/
+
+# 保留预编译 exe（dist/法院文书下载器.exe）
+!dist/
+!dist/*.exe
