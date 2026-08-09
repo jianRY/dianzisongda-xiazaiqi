@@ -46,7 +46,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.0"
+VERSION = "1.1"
 
 
 # ---------------- 核心下载逻辑（与命令行版一致） ----------------
@@ -306,7 +306,8 @@ class App:
         frm1 = ttk.Frame(root)
         frm1.pack(fill="x", padx=12, pady=(10, 2))
         ttk.Label(frm1, text="① 粘贴法院送达短信或链接（支持批量：多个链接自动依次下载）", font=("Microsoft YaHei", 10)).pack(side="left")
-        ttk.Button(frm1, text="📋 粘贴", command=self.paste_text).pack(side="right")
+        ttk.Button(frm1, text="🗑 清空", command=self.clear_text).pack(side="right")
+        ttk.Button(frm1, text="📋 粘贴", command=self.paste_text).pack(side="right", padx=(0, 4))
         self.text_in = scrolledtext.ScrolledText(
             root, height=6, wrap="word", font=("Microsoft YaHei", 10)
         )
@@ -517,6 +518,14 @@ class App:
         # Ctrl+V 等原生粘贴：先清占位符，再交给默认行为插入
         self._clear_placeholder()
         return  # 不拦截，默认粘贴照常执行
+
+    def clear_text(self):
+        """清空按钮：删除全部内容并恢复置灰占位符。"""
+        self.text_in.delete("1.0", "end")
+        self.text_in.insert("1.0", self.placeholder_text)
+        self.text_in.configure(fg="#9a9a9a")
+        self.is_placeholder = True
+        self.text_in.focus_set()
 
     def paste_text(self):
         """粘贴按钮：清空占位符后，把剪贴板内容插入光标处。"""
