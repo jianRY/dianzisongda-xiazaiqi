@@ -37,7 +37,8 @@ android.api = 33
 android.minapi = 21
 # (str) 钉死稳定版 build-tools，避免拉到超新的 37 导致许可证/兼容问题
 android.build_tools = 33.0.2
-android.ndk = 23b
+# (str) NDK 版本：python-for-android 要求 >= 25（23b 会报 minimum supported NDK version is 25）
+android.ndk = 25b
 android.arch = arm64-v8a
 
 # (bool) 自动接受 Android SDK 许可证（CI 必开，否则 build-tools 装不上）
