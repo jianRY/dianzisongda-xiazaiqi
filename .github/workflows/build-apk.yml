@@ -50,10 +50,12 @@ jobs:
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip
-          # 钉死 buildozer 1.4.0（默认 1.5.0 + 新版 p4a 的 release apk CLI 不兼容，会报
-          # `toolchain.py: error: argument subparser_name: invalid choice`）
-          # cython 是 buildozer 1.4.0 环境检查的硬性要求（不装会 Search for Cython not found 直接退出）
-          pip install "buildozer==1.4.0" cython
+          # buildozer 1.4.0 + python-for-android 2023.10.27 同时代配套（老 CLI `toolchain <dist>`）。
+          # 不能只 pin buildozer：pip 会装最新 p4a（新 CLI 需 `toolchain apk <dist>` 前缀），
+          # 导致 release 报 `argument subparser_name: invalid choice`。
+          # cython 是 buildozer 1.4.0 环境检查的硬性要求。
+          pip install "buildozer==1.4.0" "python-for-android==2023.10.27" cython
+          python -c "import pythonforandroid, buildozer; print('p4a', pythonforandroid.__version__ if hasattr(pythonforandroid,'__version__') else '?', '| buildozer ok')" || true
 
       # secret 不能直接用在 if: 表达式（422），先读成 step 输出供后续引用
       - name: Detect keystore secret
