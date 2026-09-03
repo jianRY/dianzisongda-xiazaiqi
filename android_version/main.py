@@ -27,6 +27,44 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
 from kivy.uix.progressbar import ProgressBar
 from kivy.utils import platform
+from kivy.core.window import Window
+from kivy.core.text import LabelBase
+
+
+# ---------------- 全局 UI 默认值（解决「全黑 + 豆腐字」问题） ----------------
+CJK_FONT = 'Roboto'  # 兜底；如成功注册系统字体则改为 'CJK'
+
+
+def _setup_ui_defaults():
+    """注册系统中文字体 + 设置浅色背景。
+
+    安卓真机上常自带 NotoSansCJK 系列，把它们注册为 Kivy 的 'CJK' 字体并
+    作为所有 Label/Button/TextInput 的默认 font_name，避免中文豆腐字。
+    同时把 Window.clearcolor 改为浅色，否则黑色背景下 Kivy 默认白色文字
+    在某些主题下对比度极差，看不清。
+    """
+    global CJK_FONT
+    if platform == 'android':
+        # 安卓各厂商/版本字体路径可能略有差异，按优先级试
+        for p in (
+            '/system/fonts/NotoSansCJK-Regular.otf',
+            '/system/fonts/NotoSansCJK-Regular.ttc',
+            '/system/fonts/SourceHanSansSC-Regular.otf',
+            '/system/fonts/DroidSansFallback.ttf',
+        ):
+            if os.path.exists(p):
+                try:
+                    LabelBase.register(name='CJK', fn_regular=p)
+                    CJK_FONT = 'CJK'
+                except Exception:
+                    pass
+                break
+    # 浅色背景：让深色文字有足够对比度（默认黑色背景是「看不清」元凶）
+    Window.clearcolor = (0.96, 0.97, 0.98, 1)
+
+
+_setup_ui_defaults()
+
 
 # ---------------- 存储路径 ----------------
 def get_base_dir():
@@ -103,43 +141,54 @@ def open_in_viewer(path):
 class CourtApp(App):
     def build(self):
         self.running = False
-        root = BoxLayout(orientation="vertical", padding=12, spacing=8)
+        font_name = CJK_FONT
+        # padding 顶部多留 28 让出状态栏/权限弹窗占位空间
+        root = BoxLayout(orientation="vertical", padding=(12, 28, 12, 12), spacing=8)
 
         root.add_widget(Label(
-            text="法院文书下载器", font_size=22, size_hint_y=None, height=34,
+            text="法院文书下载器", font_name=font_name, font_size=22, size_hint_y=None, height=34,
             bold=True, color=(0.12, 0.43, 0.92, 1)))
         root.add_widget(Label(
             text="粘贴法院电子送达短信 / 链接，自动下载全部文书",
-            font_size=13, size_hint_y=None, height=20, color=(0.4, 0.46, 0.55, 1)))
+            font_name=font_name, font_size=13, size_hint_y=None, height=20,
+            color=(0.4, 0.46, 0.55, 1)))
 
         self.txt = TextInput(
             hint_text="【苏州市虎丘区人民法院】…查阅：https://zxfw.court.gov.cn/...?qdbh=...&sdbh=...&sdsin=...",
-            multiline=True, size_hint_y=None, height=120, font_size=15)
+            font_name=font_name,
+            multiline=True, size_hint_y=None, height=120, font_size=15,
+            foreground_color=(0.1, 0.1, 0.1, 1),
+        )
         root.add_widget(self.txt)
 
-        self.btn_start = Button(text="⬇ 开始下载", size_hint_y=None, height=50,
-                                font_size=18, background_color=(0.12, 0.43, 0.92, 1))
+        self.btn_start = Button(
+            text="⬇ 开始下载", font_name=font_name, size_hint_y=None, height=50,
+            font_size=18, background_color=(0.12, 0.43, 0.92, 1),
+            color=(1, 1, 1, 1),
+        )
         self.btn_start.bind(on_press=self.on_start_press)
         root.add_widget(self.btn_start)
 
         self.bar = ProgressBar(max=1, value=0, size_hint_y=None, height=12)
         root.add_widget(self.bar)
 
-        self.status = Label(text="", size_hint_y=None, height=22, font_size=13,
-                            color=(0.3, 0.35, 0.45, 1))
+        self.status = Label(text="", font_name=font_name, size_hint_y=None, height=22,
+                            font_size=13, color=(0.3, 0.35, 0.45, 1))
         root.add_widget(self.status)
 
         # 日志（可滚动）
-        self.log = Label(text="", font_size=13, size_hint_y=None, markup=False,
-                         text_size=(None, None), halign="left", valign="top")
+        self.log = Label(text="", font_name=font_name, font_size=13, size_hint_y=None,
+                         markup=False, text_size=(None, None), halign="left", valign="top",
+                         color=(0.1, 0.1, 0.1, 1))
         self.log.bind(width=lambda *x: self.log.setter("text_size")(self.log, (self.log.width, None)))
         self.log.bind(texture_size=lambda inst, sz: inst.setter("height")(inst, sz[1]))
         sv = ScrollView(size_hint_y=1)
         sv.add_widget(self.log)
         root.add_widget(sv)
 
-        self.btn_open = Button(text="📂 打开保存文件夹", size_hint_y=None, height=42,
-                               disabled=True)
+        self.btn_open = Button(text="📂 打开保存文件夹", font_name=font_name,
+                               size_hint_y=None, height=42, disabled=True,
+                               color=(0.2, 0.2, 0.2, 1))
         self.btn_open.bind(on_press=self.on_open)
         root.add_widget(self.btn_open)
 
