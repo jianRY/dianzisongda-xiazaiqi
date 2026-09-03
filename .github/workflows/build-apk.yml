@@ -18,14 +18,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build APK with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          command: buildozer android debug
-          buildozer_version: stable
-          workdir: android_version
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git unzip openjdk-17-jdk \
+            autoconf automake libtool pkg-config \
+            libltdl-dev libffi-dev libssl-dev zlib1g-dev \
+            libncurses5-dev libsqlite3-dev libreadline-dev \
+            tk-dev libgdbm-dev libc6-dev flex bison g++
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))" >> "$GITHUB_ENV"
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install buildozer
+
+      - name: Build APK (buildozer android debug)
+        working-directory: android_version
+        run: buildozer android debug 2>&1 | tee /tmp/buildozer.log
+
+      - name: Show buildozer log on failure
+        if: failure()
+        run: |
+          echo "==== buildozer.log tail ===="
+          tail -n 80 /tmp/buildozer.log || true
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: court-doc-apk
