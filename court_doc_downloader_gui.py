@@ -30,6 +30,9 @@ import json
 import os
 import re
 import ssl
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -46,7 +49,9 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.1"
+VERSION = "1.2"
+# 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
+GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/releases/latest"
 
 
 # ---------------- 核心下载逻辑（与命令行版一致） ----------------
@@ -161,6 +166,38 @@ def download_file(url, path, ctx):
             if attempt < MAX_RETRY:
                 time.sleep(RETRY_BACKOFF * attempt)
     raise RuntimeError("下载失败（已重试 %d 次）：%s" % (MAX_RETRY, last_err))
+
+
+def _parse_version(v):
+    """把 'v1.2.3' / '1.2' 解析成可按元组比较的数字序列。"""
+    v = v.strip().lstrip("vV")
+    parts = re.split(r"[.\-]", v)
+    out = []
+    for p in parts:
+        m = re.match(r"\d+", p)
+        out.append(int(m.group()) if m else 0)
+    return tuple(out)
+
+
+def _version_greater(remote, local):
+    try:
+        return _parse_version(remote) > _parse_version(local)
+    except Exception:
+        return False
+
+
+def download_generic(url, path, timeout=120):
+    """通用下载（更新用），不做文件类型校验。自动继承系统代理环境变量。"""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open(path, "wb") as f:
+            while True:
+                buf = resp.read(65536)
+                if not buf:
+                    break
+                f.write(buf)
+    if os.path.getsize(path) == 0:
+        raise IOError("下载到 0 字节")
 
 
 def sanitize_filename(name):
@@ -302,6 +339,9 @@ class App:
         except Exception:
             pass
 
+        # 顶部菜单栏
+        self._build_menubar()
+
         # ① 粘贴区
         frm1 = ttk.Frame(root)
         frm1.pack(fill="x", padx=12, pady=(10, 2))
@@ -383,6 +423,7 @@ class App:
         # 底部按钮
         frm2 = ttk.Frame(root)
         frm2.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Button(frm2, text="检查更新", command=self.check_update_manual).pack(side="left")
         ttk.Button(frm2, text="打开保存文件夹", command=self.open_folder).pack(side="right")
         ttk.Button(frm2, text="清空日志", command=self.clear_log).pack(side="right", padx=6)
 
@@ -390,6 +431,12 @@ class App:
         style = ttk.Style()
         try:
             style.configure("Big.TButton", font=("Microsoft YaHei", 11, "bold"), padding=6)
+        except Exception:
+            pass
+
+        # 启动时自动检查更新（静默，无更新不打扰）
+        try:
+            threading.Thread(target=self.check_update, kwargs={"silent": True}, daemon=True).start()
         except Exception:
             pass
 
@@ -561,6 +608,168 @@ class App:
                 self.text_in.insert("insert", clip)
         except Exception:
             pass
+
+    # ---- 顶部菜单栏 ----
+    def _build_menubar(self):
+        menubar = tk.Menu(self.root)
+        # 更新菜单
+        m_update = tk.Menu(menubar, tearoff=0)
+        m_update.add_command(label="检查更新", command=self.check_update_manual)
+        menubar.add_cascade(label="更新", menu=m_update)
+        # 帮助菜单
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="使用说明", command=self.show_help)
+        m_help.add_separator()
+        m_help.add_command(label="关于", command=self.show_about)
+        menubar.add_cascade(label="帮助", menu=m_help)
+        self.root.config(menu=menubar)
+
+    def show_help(self):
+        """使用说明窗口。"""
+        win = tk.Toplevel(self.root)
+        win.title("使用说明 · 法院文书下载器 v" + VERSION)
+        win.geometry("660x560")
+        win.resizable(True, True)
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+        txt = scrolledtext.ScrolledText(win, wrap="word", font=("Microsoft YaHei", 10))
+        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        content = (
+            "【法院文书下载器 · 使用说明】\n\n"
+            "本工具用于从「全国法院统一送达平台」发来的电子送达短信/链接中，\n"
+            "自动下载对应的裁判文书（PDF）到本地文件夹。\n\n"
+            "————————— 使用步骤 —————————\n"
+            "1. 粘贴：把法院送达短信整段（或其中的链接）粘贴到顶部文本框。\n"
+            "   · 支持批量：一次粘贴多个链接，会自动依次下载。\n"
+            "   · 文本框右键有「粘贴 / 复制 / 剪切 / 全选」菜单。\n"
+            "   · 「🗑 清空」按钮可一键清掉内容并恢复占位提示。\n"
+            "2. 保存路径：默认「桌面\\文书」，可点「选择」改为任意文件夹；\n"
+            "   程序会记住上次的选择。\n"
+            "3. 选项：\n"
+            "   · 下载完成后打开：不打开 / 打开根目录 / 打开每个案件文件夹。\n"
+            "   · PDF 转 JPG：勾选后自动把 PDF 转成图片。\n"
+            "     - 模式一：所有图片放到一个「图片」文件夹；\n"
+            "     - 模式二：按 PDF 文件名各自建子文件夹存放。\n"
+            "     - 图片长边 2000 像素、高质量、短边自适应；多页自动加页码。\n"
+            "4. 开始：点「开始下载」，进度条实时显示「已下载 / 总份数」。\n"
+            "   每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
+            "   防止同名法院不同链接的文件被合并。\n\n"
+            "————————— 自动更新 —————————\n"
+            "· 程序启动时会自动静默检查更新，有新版会弹窗提示。\n"
+            "· 也可点菜单「更新 → 检查更新」手动检查。\n"
+            "· 确认更新后会自动下载新程序、替换旧文件并重启。\n\n"
+            "————————— 常见问题 —————————\n"
+            "Q：提示下载失败 / 链接无效？\n"
+            "A：电子送达链接有时效，请重新从法院短信复制最新链接再试。\n\n"
+            "Q：下载到的文件只有几 KB？\n"
+            "A：多为链接已过期或需重新获取，请换用最新短信链接。\n\n"
+            "Q：转 JPG 后图片打不开？\n"
+            "A：请确认已勾选「PDF 转 JPG」且磁盘有足够空间。\n\n"
+            "————————— 备注 —————————\n"
+            "本工具仅供本人依法处理诉讼事务使用，请遵守相关平台与法律规定。\n"
+        )
+        txt.insert("1.0", content)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 10))
+
+    def show_about(self):
+        messagebox.showinfo(
+            "关于",
+            "法院文书下载器  v%s\n\n"
+            "从全国法院统一送达平台自动下载电子送达文书。\n"
+            "数据来源：zxfw.court.gov.cn\n\n"
+            "仅供本人依法处理诉讼事务使用。" % VERSION,
+        )
+
+    # ---- 自动检查更新 ----
+    def check_update(self, silent=False):
+        """检查 GitHub 最新 Release。silent=True 用于启动静默检查（无更新不打扰）。"""
+        try:
+            req = urllib.request.Request(
+                GITHUB_API_LATEST,
+                headers={"User-Agent": BROWSER_UA, "Accept": "application/vnd.github+json"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            dl = None
+            for a in data.get("assets", []):
+                if a.get("name", "").lower().endswith(".exe"):
+                    dl = a.get("browser_download_url")
+                    break
+            notes = data.get("body", "") or ""
+            if not dl:
+                if not silent:
+                    self.root.after(0, lambda: messagebox.showinfo("检查更新", "未找到可用的更新文件。"))
+                return
+            if _version_greater(tag, VERSION):
+                self.root.after(0, lambda: self._prompt_update(tag, dl, notes))
+            elif not silent:
+                self.root.after(0, lambda: messagebox.showinfo("检查更新", "已是最新版本 v%s。" % VERSION))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):
+                msg = "无法自动检查更新：该仓库 / Release 为私有或不可见，需将其设为公开后才能免密自动下载。可前往 GitHub 手动下载。"
+            else:
+                msg = "检查更新失败（HTTP %d）。" % e.code
+            if not silent:
+                self.root.after(0, lambda m=msg: messagebox.showwarning("检查更新", m))
+        except Exception as e:  # noqa: BLE001
+            if not silent:
+                self.root.after(0, lambda: messagebox.showwarning("检查更新", "检查更新失败：%s" % e))
+
+    def check_update_manual(self):
+        self.check_update(silent=False)
+
+    def _prompt_update(self, tag, dl_url, notes):
+        info = "发现新版本 %s（当前 v%s）。\n\n是否立即下载并更新？" % (tag, VERSION)
+        if notes.strip():
+            info += "\n\n更新内容：\n" + notes.strip()[:600]
+        if messagebox.askyesno("发现新版本", info):
+            self._do_update(dl_url)
+
+    def _do_update(self, dl_url):
+        self.log_msg("开始下载更新…")
+        tmp = os.path.join(tempfile.gettempdir(), "法院文书下载器_更新.exe")
+        try:
+            download_generic(dl_url, tmp, timeout=180)
+        except Exception as e:  # noqa: BLE001
+            self.log_msg("✗ 更新下载失败：%s" % e)
+            self.root.after(0, lambda: messagebox.showerror("更新失败", "下载新版本失败：%s" % e))
+            return
+        if os.path.getsize(tmp) < 100000:
+            self.log_msg("✗ 下载文件过小，疑似失败")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return
+        current = os.path.abspath(sys.executable)
+        self.log_msg("下载完成，准备重启并替换旧程序…")
+        bat = os.path.join(tempfile.gettempdir(), "法院文书下载器_updater.bat")
+        cur = current.replace("/", "\\")
+        tmpn = tmp.replace("/", "\\")
+        try:
+            with open(bat, "w", encoding="gbk") as f:
+                f.write("@echo off\n")
+                f.write(":wait\n")
+                f.write("timeout /t 1 /nobreak >nul\n")
+                f.write('del /f /q "%s"\n' % cur)
+                f.write('if exist "%s" goto wait\n' % cur)
+                f.write('move /y "%s" "%s"\n' % (tmpn, cur))
+                f.write('start "" "%s"\n' % cur)
+                f.write('del /f /q "%~f0"\n')
+        except Exception as e:  # noqa: BLE001
+            self.log_msg("✗ 生成更新脚本失败：%s" % e)
+            return
+        try:
+            subprocess.Popen(["cmd", "/c", bat], shell=False)
+        except Exception as e:  # noqa: BLE001
+            self.log_msg("✗ 启动更新失败：%s" % e)
+            return
+        self.root.destroy()
 
     def on_start(self):
         if self.running:
