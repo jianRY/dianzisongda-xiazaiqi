@@ -98,7 +98,7 @@ jobs:
 
       # 首次生成 keystore 时把它交出来（供下载保存并回填为 secret，以后 key 固定）
       - name: Upload newly generated keystore
-        if: steps.btype.outputs.bt == 'release' && secrets.ANDROID_KEYSTORE_B64 == ''
+        if: steps.btype.outputs.bt == 'release' && steps.ksec.outputs.present == 'no'
         uses: actions/upload-artifact@v4
         with:
           name: android-keystore
