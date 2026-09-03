@@ -30,15 +30,17 @@ fullscreen = 0
 # presplash.filename = %(source.dir)s/presplash.png
 
 #
-# Android 专属
+# Android 专属（注意：以下 android.* 必须放在 [app] 段，放 [buildozer] 段会被忽略）
 #
-[buildozer]
-
 # (int) 目标 Android API（按需调整，需 >= minapi）
 android.api = 33
 android.minapi = 21
+# (str) 钉死稳定版 build-tools，避免拉到超新的 37 导致许可证/兼容问题
+android.build_tools = 33.0.2
 android.ndk = 23b
 android.arch = arm64-v8a
+
+# (bool) 自动接受 Android SDK 许可证（CI 必开，否则 build-tools 装不上）
 android.accept_sdk_license = True
 
 # 权限：联网取文书 + 写存储保存 PDF
@@ -52,3 +54,11 @@ android.logcat_filters = *:S python:D
 
 # (bool) 使用 AAB（Google Play 上架需要）；调试/侧载用 APK 设为 false
 android.release = false
+
+[buildozer]
+
+# (int) Log level (0 = minimal, 1 = verbose, 2 = very verbose)
+log_level = 2
+
+# (bool) 跳过确认提示
+warn_on_root = 0
