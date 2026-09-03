@@ -11,6 +11,24 @@
 
 ---
 
+## ✅ 已成功构建 APK（直接可用，无需自己打包）
+
+GitHub Actions 云端已编译出可安装的 debug 包：
+
+- **文件名**：`fayuansongda-1.0-arm64-v8a-debug.apk`（约 21 MB，debug 自带签名）
+- **位置**：本项目 `android_version/dist/` 目录（同时作为 Actions Artifact `court-doc-apk` 上传，可在 Actions 页面下载）
+- **架构**：`arm64-v8a`（2015 年后的安卓手机基本都支持；极老的仅 32 位手机不支持）
+
+### 手机安装步骤
+1. 把 `fayuansongda-1.0-arm64-v8a-debug.apk` 传到手机（USB / 微信文件传输 / 网盘 / 邮件附件均可）。
+2. 手机「设置 → 安全（或隐私）→ 安装未知应用」中，允许你用来打开该 apk 的 App（如文件管理器 / 浏览器）安装未知来源应用。
+3. 在手机上点击 apk → 安装 → 打开。
+4. 首次使用：粘贴法院送达短信或链接 → 点「开始下载」，文书 PDF 会存到手机 `Download/法院文书/`。
+
+> 说明：debug 包使用 Android 默认 debug 签名，不影响安装；若日后要上架应用商店再走正式签名即可。
+
+---
+
 ## 目录结构
 
 ```

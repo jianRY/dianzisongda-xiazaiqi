@@ -1,19 +1,32 @@
 name: Build Android APK
 
 on:
-  # 手动触发（推荐）：在仓库 Actions 页面点 "Run workflow"
+  # 手动触发（正式签名 release / 快速 debug 二选一）
   workflow_dispatch:
-  # 推送 android_version 或本工作流时自动触发
+    inputs:
+      build_type:
+        description: '构建类型'
+        type: choice
+        default: release
+        options:
+          - debug
+          - release
+  # 仅当核心源码 / spec / workflow 变化时自动编 debug（README 等文档改动不触发，避免白等全量编译）
   push:
     branches: [ master ]
     paths:
-      - 'android_version/**'
+      - 'android_version/main.py'
+      - 'android_version/court_core.py'
+      - 'android_version/buildozer.spec'
       - '.github/workflows/build-apk.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      # 正式签名 keystore 固定口令（公开无妨：keystore 文件本身保密即可，见 android_version/README_安卓版.md）
+      KS_PASS: fayuansongda2026
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,11 +52,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install buildozer
 
-      - name: Build APK (buildozer android debug)
+      # 构建类型：push 自动触发默认 debug；手动触发按 input（release = 正式签名）
+      - name: Resolve build type
+        id: btype
+        run: |
+          BT="${{ github.event.inputs.build_type || 'debug' }}"
+          echo "bt=$BT" >> "$GITHUB_OUTPUT"
+
+      # release 需要正式 keystore：优先用 secret（保证每次同一把 key，可覆盖升级）；
+      # 首次无 secret 时用 keytool 生成一把新的，随后会作为 artifact 上传，请下载保存并回填 secret。
+      - name: Prepare keystore (release)
+        if: steps.btype.outputs.bt == 'release'
+        working-directory: android_version
+        run: |
+          set -euo pipefail
+          KS="${{ secrets.ANDROID_KEYSTORE_B64 }}"
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > release.keystore
+            echo "keystore restored from secret"
+          else
+            keytool -genkeypair -v \
+              -keystore release.keystore \
+              -alias fayuansongda \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=Fayuan Songda Downloader, OU=Dev, O=jianRY, L=Suzhou, ST=Jiangsu, C=CN" 2>&1 | tail -3
+            echo "keystore newly generated"
+          fi
+          ls -la release.keystore
+
+      - name: Build APK
         working-directory: android_version
         run: |
           set -o pipefail
-          buildozer android debug 2>&1 | tee buildozer.log
+          BT="${{ steps.btype.outputs.bt }}"
+          echo "== buildozer android $BT =="
+          buildozer android "$BT" 2>&1 | tee buildozer.log
 
       - name: Show buildozer log on failure
         if: failure()
@@ -51,6 +95,15 @@ jobs:
         run: |
           echo "==== buildozer.log tail ===="
           tail -n 120 buildozer.log || true
+
+      # 首次生成 keystore 时把它交出来（供下载保存并回填为 secret，以后 key 固定）
+      - name: Upload newly generated keystore
+        if: steps.btype.outputs.bt == 'release' && secrets.ANDROID_KEYSTORE_B64 == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-keystore
+          path: android_version/release.keystore
+          if-no-files-found: warn
 
       - name: Upload APK
         if: always()

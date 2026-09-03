@@ -53,8 +53,16 @@ android.fileprovider = True
 # (str) Android 日志标签
 android.logcat_filters = *:S python:D
 
-# (bool) 使用 AAB（Google Play 上架需要）；调试/侧载用 APK 设为 false
-android.release = false
+# ---- 正式签名（release 构建）----
+# 用 `buildozer android release` 出正式签名包。release.keystore 仅存在于 CI 构建期
+# （由 secret ANDROID_KEYSTORE_B64 解码生成；首次无 secret 时 CI 用 keytool 生成并上传 artifact），
+# 不入库（见仓库 .gitignore）。keystore 口令固定公开（keystore 文件本身保密即可）。
+# 注意：一旦分发过某把 key 签名的包，就必须一直用它签后续版本，否则无法覆盖安装。
+android.release_artifact = fayuansongda
+android.keystore = release.keystore
+android.keystore_alias = fayuansongda
+android.keystore_password = fayuansongda2026
+android.keystore_alias_password = fayuansongda2026
 
 [buildozer]
 
