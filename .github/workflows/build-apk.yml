@@ -41,13 +41,16 @@ jobs:
 
       - name: Build APK (buildozer android debug)
         working-directory: android_version
-        run: buildozer android debug 2>&1 | tee /tmp/buildozer.log
+        run: |
+          set -o pipefail
+          buildozer android debug 2>&1 | tee buildozer.log
 
       - name: Show buildozer log on failure
         if: failure()
+        working-directory: android_version
         run: |
           echo "==== buildozer.log tail ===="
-          tail -n 80 /tmp/buildozer.log || true
+          tail -n 120 buildozer.log || true
 
       - name: Upload APK
         if: always()
@@ -56,3 +59,11 @@ jobs:
           name: court-doc-apk
           path: android_version/bin/*.apk
           if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: android_version/buildozer.log
+          if-no-files-found: ignore
