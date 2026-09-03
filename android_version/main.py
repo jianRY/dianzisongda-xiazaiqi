@@ -6,7 +6,7 @@
 
 说明：
     - 本文件是「原生安卓 App」的源码，复用 court_core.py 的核心逻辑。
-    - 在电脑上可直接 `python kivy_main.py` 运行测试（需 pip install kivy）。
+    - 在电脑上可直接 `python main.py` 运行测试（需 pip install kivy）。
     - 打包成 APK 见同目录 buildozer.spec 与 README_安卓版.md。
     - 文书会下载到手机「Download/法院文书/<案件>/」目录，可用文件管理器打开。
 

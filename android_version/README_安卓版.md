@@ -18,7 +18,7 @@ android_version/
 ├── court_core.py        # 共享核心逻辑（解析/取清单/下载，零依赖）
 ├── server.py            # ① 网页版后端（Python 标准库，零第三方依赖）
 ├── index.html           # ① 手机前端（移动优先、无外部依赖）
-├── kivy_main.py         # ② 安卓 APK 源码（Kivy）
+├── main.py             # ② 安卓 APK 源码（Kivy，入口必须为 main.py）
 ├── buildozer.spec       # ② 打包配置
 ├── downloads/           # ① 网页版下载落盘目录（自动创建）
 └── README_安卓版.md
@@ -66,7 +66,7 @@ python server.py --no-verify          # 内网证书异常时关闭 SSL 校验
 ### 0. 先在电脑上验证逻辑（可选）
 ```bash
 pip install kivy
-python kivy_main.py     # 弹窗界面，粘贴短信即可测试下载逻辑
+python main.py     # 弹窗界面，粘贴短信即可测试下载逻辑
 ```
 下载会保存到 `~/Downloads/法院文书/<案件>/`。
 

@@ -10,8 +10,8 @@ package.domain = org.example
 # (str) 源码目录与入口
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,txt,json
-# 入口脚本
-main.filename = kivy_main.py
+# 入口必须是 main.py（python-for-android 只认 main.py 作为入口，main.filename 选项对它无效）
+source.exclude_patterns = server.py, index.html, README_安卓版.md, buildozer.spec, *.pyc, .buildozer
 version = 1.0
 
 # (list) 依赖：仅 Python + Kivy（court_core.py 为零依赖标准库模块）
@@ -47,7 +47,7 @@ android.accept_sdk_license = True
 # 权限：联网取文书 + 写存储保存 PDF
 android.permissions = INTERNET, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE
 
-# 启用 FileProvider（kivy_main.py 用其打开 PDF 预览）
+# 启用 FileProvider（main.py 用其打开 PDF 预览）
 android.fileprovider = True
 
 # (str) Android 日志标签
