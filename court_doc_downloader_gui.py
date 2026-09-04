@@ -7,22 +7,24 @@
 功能：
     - 粘贴法院电子送达短信（或仅链接）到文本框
     - 点击“开始下载”，自动从文本中提取 zxfw.court.gov.cn 的送达链接
-    - 调接口拿到该案件全部文书，逐一下载 PDF 到本地
+    - 调接口拿到该案件全部文书，**多线程并发下载** PDF 到本地
     - 保存路径可“选择”，也可直接在框里手填；不选则默认：桌面\文书（不存在自动新建）
     - 上次选择的路径与“完成后打开文件夹”方式会被记住（写入 %APPDATA%）
     - “下载完成后打开文件夹”三档可选：不打开 / 打开保存根目录 / 打开每个案件文件夹
     - 可勾选“下载后自动转为 JPG 图片”（长边 2000px、高质量）；两种目录模式可选：
         ① 所有图片统一放进案件下的“图片”文件夹
         ② 按 PDF 文件名各自建子文件夹存放对应图片（多页自动加页码）
-    - 带进度条，实时显示“已下载 / 总份数”
+    - 带进度条（份数 + 百分比），实时显示“已下载 / 总份数 (xx%)”
+    - 下载中按钮变为“⏸ 取消下载”，点击可中途取消未完成的任务
     - 每个案件自动建子文件夹：法院名_案号_启动时间戳\（时间戳为年月日时分秒纯数字，避免同名法院不同链接合并）
 
 原理（与命令行版一致，已实测）：
     - 文书列表接口免登录：POST .../getWsListBySdbhNew，body 含 qdbh/sdbh/sdsin
     - OSS 签名链接有效期极短 → 每次运行现取现下
     - OSS 签名绑定 HTTP 方法 → 只用 GET
+    - 同一案件的文书清单一次拿到 N 份 OSS 签名 URL，文件之间互相独立 → 用线程池并发下载
 
-依赖：仅 Python 标准库（tkinter / urllib / ssl 等）。
+依赖：仅 Python 标准库（tkinter / urllib / ssl / concurrent.futures 等）。
 打包：pyinstaller --onefile --windowed court_doc_downloader_gui.py
 """
 
@@ -36,6 +38,8 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import urllib.error
@@ -49,7 +53,9 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.2"
+VERSION = "1.3"
+# 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
+MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
 GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/releases/latest"
 
@@ -133,9 +139,20 @@ def fetch_doc_list(params, ctx):
     return docs
 
 
-def download_file(url, path, ctx):
+def download_file(url, path, ctx, cancel_check=None):
+    """下载单个文书文件。
+
+    Args:
+        cancel_check: 可选的零参数回调，返回 True 表示已取消 → 抛 CancelledError 提前退出。
+    """
     last_err = None
+
+    class _Cancelled(Exception):
+        pass
+
     for attempt in range(1, MAX_RETRY + 1):
+        if cancel_check and cancel_check():
+            raise _Cancelled()
         try:
             req = urllib.request.Request(
                 url,
@@ -145,6 +162,8 @@ def download_file(url, path, ctx):
             with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
                 with open(path, "wb") as f:
                     while True:
+                        if cancel_check and cancel_check():
+                            raise _Cancelled()
                         buf = resp.read(4096)
                         if not buf:
                             break
@@ -156,6 +175,14 @@ def download_file(url, path, ctx):
                     os.remove(path)
                     raise IOError("文件头不是 %PDF，疑似下载失败")
             return True
+        except _Cancelled:
+            # 取消：删半成品文件后向上抛
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
             if os.path.exists(path):
@@ -217,11 +244,18 @@ def safe_ext(wjgs, url):
 # ---------------- PDF -> JPG 转换（PyMuPDF / fitz） ----------------
 # 长边固定 2000px，短边按比例自适应；高画质 JPEG（quality=95）。
 # 单页：图片名 = PDF文件名.jpg；多页：PDF文件名_页码.jpg
-def convert_pdf_to_jpg(pdf_path, case_dir, mode):
+#
+# 注意：PyMuPDF 不保证线程安全，多线程并发下载后若同时转图可能崩溃。
+# 调用方应传入一个全局 threading.Lock，串行化所有 fitz 操作。
+_FITZ_LOCK = threading.Lock()
+
+
+def convert_pdf_to_jpg(pdf_path, case_dir, mode, lock=None):
     """把单个 PDF 转为 JPG，返回生成的图片数量。
 
     mode=0：所有图片放在 case_dir/图片/ 下
     mode=1：按 PDF 文件名在 case_dir/图片/<文件名>/ 下分别建文件夹
+    lock：可选 threading.Lock，用于串行化 fitz 调用（多线程场景必传）。
     """
     import fitz  # PyMuPDF，懒加载（仅转换时需要）
 
@@ -230,27 +264,29 @@ def convert_pdf_to_jpg(pdf_path, case_dir, mode):
     img_dir = os.path.join(base_img_dir, stem) if mode == JPG_MODE_PERPDF else base_img_dir
     os.makedirs(img_dir, exist_ok=True)
 
-    doc = fitz.open(pdf_path)
-    try:
-        n = doc.page_count
-        count = 0
-        target_long = 2000.0
-        for p in range(n):
-            page = doc[p]
-            long_edge = max(page.rect.width, page.rect.height)
-            zoom = target_long / long_edge if long_edge > 0 else 1.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            suffix = ("_%d" % (p + 1)) if n > 1 else ""
-            out_path = os.path.join(img_dir, stem + suffix + ".jpg")
-            try:
-                pix.save(out_path, "jpg", jpeg_quality=95)
-            except TypeError:
-                pix.save(out_path, "jpg")
-            count += 1
-        return count
-    finally:
-        doc.close()
+    lk = lock or _FITZ_LOCK
+    with lk:
+        doc = fitz.open(pdf_path)
+        try:
+            n = doc.page_count
+            count = 0
+            target_long = 2000.0
+            for p in range(n):
+                page = doc[p]
+                long_edge = max(page.rect.width, page.rect.height)
+                zoom = target_long / long_edge if long_edge > 0 else 1.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                suffix = ("_%d" % (p + 1)) if n > 1 else ""
+                out_path = os.path.join(img_dir, stem + suffix + ".jpg")
+                try:
+                    pix.save(out_path, "jpg", jpeg_quality=95)
+                except TypeError:
+                    pix.save(out_path, "jpg")
+                count += 1
+            return count
+        finally:
+            doc.close()
 
 
 # ---------------- 路径工具 ----------------
@@ -320,6 +356,24 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode):
 
 
 # ---------------- GUI ----------------
+
+
+def _open_in_explorer(path, log_fn, empty_msg=None):
+    """跨平台打开文件夹。empty_msg 在路径不存在时弹出提示。"""
+    if path and os.path.isdir(path):
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:  # noqa: BLE001
+            log_fn("无法打开文件夹：%s" % e)
+    elif empty_msg:
+        messagebox.showinfo("提示", empty_msg)
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -330,6 +384,8 @@ class App:
         self.jpg_mode = cfg.get("jpg_mode", 0)
         self.last_case_dir = None
         self.running = False
+        self.stop_event = threading.Event()  # 取消下载信号
+        self._cancel_lock = threading.Lock()  # 保护 last_case_dir / 计数等共享状态
 
         root.title("法院文书下载器 v" + VERSION)
         root.geometry("640x620")
@@ -440,13 +496,14 @@ class App:
         except Exception:
             pass
 
-    # ---- 线程安全的日志 ----
+    # ---- 线程安全的日志（自动加 [HH:MM:SS] 时间戳）----
     def log_msg(self, msg):
         self.root.after(0, self._log_msg, msg)
 
     def _log_msg(self, msg):
+        ts = datetime.now().strftime("[%H:%M:%S] ")
         self.log.configure(state="normal")
-        self.log.insert("end", msg + "\n")
+        self.log.insert("end", ts + msg + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -494,7 +551,7 @@ class App:
     def _reset_bar(self):
         self.progress["maximum"] = 1
         self.progress["value"] = 0
-        self.progress_label.configure(text="进度：0 / 0 份")
+        self.progress_label.configure(text="进度：0 / 0 份 (0%)")
 
     def set_bar(self, total, done):
         self.root.after(0, self._set_bar, total, done)
@@ -503,31 +560,18 @@ class App:
         if total > 0:
             self.progress["maximum"] = total
         self.progress["value"] = done
-        self.progress_label.configure(text="进度：%d / %d 份" % (done, total))
+        pct = int(done * 100 / total) if total > 0 else 0
+        self.progress_label.configure(text="进度：%d / %d 份 (%d%%)" % (done, total, pct))
 
     def open_folder(self):
         target = self.last_case_dir or self.out_dir
-        if target and os.path.isdir(target):
-            try:
-                os.startfile(target)
-            except Exception as e:  # noqa: BLE001
-                self.log_msg("无法打开文件夹：%s" % e)
-        else:
-            messagebox.showinfo("提示", "还没有可打开的文件夹。")
+        _open_in_explorer(target, self.log_msg, "还没有可打开的文件夹。")
 
     def open_base_folder(self):
-        if self.out_dir and os.path.isdir(self.out_dir):
-            try:
-                os.startfile(self.out_dir)
-            except Exception as e:  # noqa: BLE001
-                self.log_msg("无法打开文件夹：%s" % e)
+        _open_in_explorer(self.out_dir, self.log_msg)
 
     def open_case_folder(self, case_dir):
-        if case_dir and os.path.isdir(case_dir):
-            try:
-                os.startfile(case_dir)
-            except Exception as e:  # noqa: BLE001
-                self.log_msg("无法打开文件夹：%s" % e)
+        _open_in_explorer(case_dir, self.log_msg)
 
     # ---- 文本框占位符（置灰）+ 粘贴按钮 + 右键菜单 ----
     def _init_placeholder(self):
@@ -637,7 +681,7 @@ class App:
         txt = scrolledtext.ScrolledText(win, wrap="word", font=("Microsoft YaHei", 10))
         txt.pack(fill="both", expand=True, padx=10, pady=10)
         content = (
-            "【法院文书下载器 · 使用说明】\n\n"
+            "【法院文书下载器 · 使用说明 v%s】\n\n"
             "本工具用于从「全国法院统一送达平台」发来的电子送达短信/链接中，\n"
             "自动下载对应的裁判文书（PDF）到本地文件夹。\n\n"
             "————————— 使用步骤 —————————\n"
@@ -646,16 +690,18 @@ class App:
             "   · 文本框右键有「粘贴 / 复制 / 剪切 / 全选」菜单。\n"
             "   · 「🗑 清空」按钮可一键清掉内容并恢复占位提示。\n"
             "2. 保存路径：默认「桌面\\文书」，可点「选择」改为任意文件夹；\n"
-            "   程序会记住上次的选择。\n"
+            "   程序会记住上次的选择；开始下载前会校验路径是否可写。\n"
             "3. 选项：\n"
             "   · 下载完成后打开：不打开 / 打开根目录 / 打开每个案件文件夹。\n"
             "   · PDF 转 JPG：勾选后自动把 PDF 转成图片。\n"
             "     - 模式一：所有图片放到一个「图片」文件夹；\n"
             "     - 模式二：按 PDF 文件名各自建子文件夹存放。\n"
             "     - 图片长边 2000 像素、高质量、短边自适应；多页自动加页码。\n"
-            "4. 开始：点「开始下载」，进度条实时显示「已下载 / 总份数」。\n"
-            "   每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
-            "   防止同名法院不同链接的文件被合并。\n\n"
+            "4. 开始：点「⬇ 开始下载」，进度条实时显示「已下载 / 总份数 (百分比)」。\n"
+            "   · 同一案件的多份文书会用 %d 个线程并发下载，速度更快。\n"
+            "   · 下载过程中按钮变为「⏸ 取消下载」，点击可中途取消未完成任务。\n"
+            "   · 每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
+            "     防止同名法院不同链接的文件被合并。\n\n"
             "————————— 自动更新 —————————\n"
             "· 程序启动时会自动静默检查更新，有新版会弹窗提示。\n"
             "· 也可点菜单「更新 → 检查更新」手动检查。\n"
@@ -669,6 +715,7 @@ class App:
             "A：请确认已勾选「PDF 转 JPG」且磁盘有足够空间。\n\n"
             "————————— 备注 —————————\n"
             "本工具仅供本人依法处理诉讼事务使用，请遵守相关平台与法律规定。\n"
+            % (VERSION, MAX_WORKERS)
         )
         txt.insert("1.0", content)
         txt.configure(state="disabled")
@@ -774,19 +821,57 @@ class App:
     def on_start(self):
         if self.running:
             return
+        # ① 若文本框仍是占位符或空内容，提示并返回
+        if getattr(self, "is_placeholder", False):
+            messagebox.showwarning("请先粘贴", "请先粘贴法院送达短信或链接再开始下载。")
+            self.text_in.focus_set()
+            return
         text = self.text_in.get("1.0", "end")
-        # 再次同步路径（保险）：以输入框当前内容为准
+        if not text.strip():
+            messagebox.showwarning("请先粘贴", "文本框为空，请先粘贴法院送达短信或链接。")
+            return
+        # ② 同步路径（保险）：以输入框当前内容为准
         self.out_dir = self.path_var.get().strip() or self.out_dir
+        if not self.out_dir:
+            messagebox.showwarning("路径为空", "请填写或选择保存路径。")
+            return
+        # ③ 路径预校验：父目录必须可写、能创建
+        try:
+            os.makedirs(self.out_dir, exist_ok=True)
+            test_file = os.path.join(self.out_dir, ".wb_write_test")
+            with open(test_file, "w") as f:
+                f.write("0")
+            os.remove(test_file)
+        except OSError as e:
+            messagebox.showerror(
+                "保存路径不可用",
+                "无法写入所选路径：\n%s\n\n请改选一个有写入权限的文件夹。" % e,
+            )
+            return
         tasks = extract_tasks(text)
         if not tasks:
             messagebox.showwarning("无法识别", "未能从文本中提取到送达链接（需含 qdbh/sdbh/sdsin）。")
             return
+        # 重置取消标志
+        self.stop_event.clear()
         self.running = True
-        self.btn_start.configure(state="disabled", text="下载中…")
+        self.btn_start.configure(state="normal", text="⏸ 取消下载", command=self.on_cancel)
         self._log_msg("法院文书下载器 v%s" % VERSION)
         self._log_msg("✓ 识别到 %d 个送达链接，将依次下载。" % len(tasks))
         t = threading.Thread(target=self.worker, args=(tasks,), daemon=True)
         t.start()
+
+    def on_cancel(self):
+        """取消下载：设置 stop_event，未完成的任务会尽快退出。"""
+        if not self.running:
+            return
+        if messagebox.askyesno(
+            "确认取消",
+            "确定要取消当前下载吗？\n\n已完成的部分文件会保留，未完成的任务将停止。",
+        ):
+            self.stop_event.set()
+            self.log_msg("⏸ 收到取消请求，正在停止剩余任务…")
+            self.btn_start.configure(state="disabled", text="正在取消…")
 
     def worker(self, tasks):
         ctx = ssl.create_default_context()
@@ -794,9 +879,15 @@ class App:
         total_all = 0
         done_count = 0
         total_docs = 0
+        cancelled = False
         self.reset_bar()
         try:
             for idx, params in enumerate(tasks, 1):
+                # 进入下一个案件前先看取消
+                if self.stop_event.is_set():
+                    self.log_msg("⏹ 已取消，跳过剩余 %d 个案件。" % (len(tasks) - idx + 1))
+                    cancelled = True
+                    break
                 self.log_msg("")
                 self.log_msg("==== 案件 %d / %d ====" % (idx, len(tasks)))
                 self.log_msg("链接：%s" % params.get("url", ""))
@@ -820,10 +911,14 @@ class App:
                 os.makedirs(base, exist_ok=True)
                 case_dir = os.path.join(base, folder)
                 os.makedirs(case_dir, exist_ok=True)
-                self.last_case_dir = case_dir
+                with self._cancel_lock:
+                    self.last_case_dir = case_dir
                 self.log_msg("→ 保存目录：%s" % case_dir)
+                self.log_msg("→ 启用 %d 线程并发下载…" % MAX_WORKERS)
 
-                success = 0
+                # 准备每份文书的下载任务（先确定本地路径，避免并发下重名竞态）
+                jobs = []  # [(i, d, full_path, raw, ext, base_name), ...]
+                used_names = set()
                 for i, d in enumerate(docs, 1):
                     raw = d.get("c_wsmc") or ("文书%d" % i)
                     ext = safe_ext(d.get("c_wjgs"), d.get("wjlj", ""))
@@ -831,53 +926,104 @@ class App:
                     filename = base_name + ext
                     full = os.path.join(case_dir, filename)
                     dup = 1
-                    while os.path.exists(full):
+                    while full in used_names or os.path.exists(full):
                         filename = "%s(%d)%s" % (base_name, dup, ext)
                         full = os.path.join(case_dir, filename)
                         dup += 1
-                    self.log_msg("[%d/%d] 下载：%s" % (i, len(docs), raw))
+                    used_names.add(full)
+                    jobs.append((i, d, full, raw, ext, base_name))
+
+                def _do_one(job):
+                    """单个文书下载 + 转换（在工作线程内执行）。"""
+                    i_, d_, full_, raw_, ext_, base_name_ = job
+                    if self.stop_event.is_set():
+                        return (i_, raw_, "cancelled", None, full_)
+                    self.log_msg("[%d/%d] 下载：%s" % (i_, len(docs), raw_))
                     try:
-                        download_file(d.get("wjlj"), full, ctx)
-                        size = os.path.getsize(full)
-                        self.log_msg("    ✓ 已保存：%s (%d 字节)" % (filename, size))
-                        success += 1
-                        if self.convert_jpg and filename.lower().endswith(".pdf"):
+                        download_file(
+                            d_.get("wjlj"), full_, ctx,
+                            cancel_check=lambda: self.stop_event.is_set(),
+                        )
+                        size = os.path.getsize(full_)
+                        msg = "    ✓ 已保存：%s (%d 字节)" % (os.path.basename(full_), size)
+                        # 同步转 JPG（fitz 用全局 lock 串行化，避免崩溃）
+                        if (
+                            self.convert_jpg
+                            and os.path.basename(full_).lower().endswith(".pdf")
+                            and not self.stop_event.is_set()
+                        ):
                             try:
-                                cnt = convert_pdf_to_jpg(full, case_dir, self.jpg_mode)
-                                self.log_msg("    ✓ 已转 JPG：%d 页" % cnt)
+                                cnt = convert_pdf_to_jpg(full_, case_dir, self.jpg_mode)
+                                msg += "  ✓ 转 JPG：%d 页" % cnt
                             except Exception as e2:  # noqa: BLE001
-                                self.log_msg("    ✗ 转 JPG 失败：%s" % e2)
+                                msg += "  ✗ 转 JPG 失败：%s" % e2
+                        return (i_, raw_, "ok", msg, full_)
                     except Exception as e:  # noqa: BLE001
-                        self.log_msg("    ✗ 失败：%s" % e)
-                    done_count += 1
-                    self.set_bar(total_docs, done_count)
+                        return (i_, raw_, "fail", "    ✗ 失败：%s" % e, full_)
+
+                success = 0
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                    futures = {ex.submit(_do_one, j): j for j in jobs}
+                    for fut in as_completed(futures):
+                        try:
+                            i, raw, status, msg, full = fut.result()
+                        except Exception as e:  # noqa: BLE001
+                            self.log_msg("    ✗ 任务异常：%s" % e)
+                            done_count += 1
+                            self.set_bar(total_docs, done_count)
+                            continue
+                        self.log_msg(msg)
+                        if status == "ok":
+                            success += 1
+                        elif status == "cancelled":
+                            # 已取消：剩余 future 还在跑，等它们自己看到 stop_event 退出
+                            pass
+                        done_count += 1
+                        self.set_bar(total_docs, done_count)
+                        # 用户中途取消：尽早取消未启动的 future
+                        if self.stop_event.is_set():
+                            for f2 in futures:
+                                if not f2.running() and not f2.done():
+                                    f2.cancel()
+                            cancelled = True
 
                 total_ok += success
                 total_all += len(docs)
                 self.log_msg("--- 本案完成：%d / %d 份 ---" % (success, len(docs)))
 
                 # 模式：打开每个案件文件夹
-                if self.auto_open_mode == AUTO_OPEN_EACH:
-                    self.open_case_folder(case_dir)
+                if self.auto_open_mode == AUTO_OPEN_EACH and not cancelled:
+                    _open_in_explorer(case_dir, self.log_msg)
+
+                if cancelled:
+                    break
 
             self.set_bar(total_docs, done_count)
-            self.log_msg("")
-            self.log_msg("=== 全部完成：成功 %d / %d 份（%d 个案件）===" % (total_ok, total_all, len(tasks)))
-            if total_ok < total_all:
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "部分失败", "成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
-            else:
+            if cancelled:
+                self.log_msg("")
+                self.log_msg("=== 已取消：成功 %d / %d 份 ===" % (total_ok, max(total_all, done_count)))
                 self.root.after(0, lambda: messagebox.showinfo(
-                    "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (len(tasks), total_ok)))
-            # 模式：打开保存根目录（批量时可见所有案件子文件夹）
-            if self.auto_open_mode == AUTO_OPEN_ROOT and self.out_dir and os.path.isdir(self.out_dir):
-                self.root.after(50, self.open_base_folder)
+                    "已取消", "下载已取消。成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
+            else:
+                self.log_msg("")
+                self.log_msg("=== 全部完成：成功 %d / %d 份（%d 个案件）===" % (total_ok, total_all, len(tasks)))
+                if total_ok < total_all:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "部分失败", "成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
+                else:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (len(tasks), total_ok)))
+                # 模式：打开保存根目录（批量时可见所有案件子文件夹）
+                if self.auto_open_mode == AUTO_OPEN_ROOT and self.out_dir and os.path.isdir(self.out_dir):
+                    self.root.after(50, self.open_base_folder)
         except Exception as e:  # noqa: BLE001
             self.log_msg("✗ 出错了：%s" % e)
             self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
         finally:
             self.running = False
-            self.root.after(0, lambda: self.btn_start.configure(state="normal", text="⬇ 开始下载"))
+            self.stop_event.clear()
+            self.root.after(0, lambda: self.btn_start.configure(
+                state="normal", text="⬇ 开始下载", command=self.on_start))
 
 
 def main():
