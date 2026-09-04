@@ -5,9 +5,13 @@ __pycache__/
 # PyInstaller 构建中间目录
 bld/
 bld_*/
+bld[0-9]*/
 bld_tmp/
 chkb/
 *.spec.bak
+
+# 本地下载产物（含真实案件材料，不发布）
+法院文书/
 
 # 依赖 / 分块下载缓存
 pipcache/
