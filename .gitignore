@@ -18,10 +18,6 @@ pymupdf.whl.parts/
 download_test*.pdf
 chunk_*
 
-# 安卓构建产物与签名（dist 内 APK 不入库；keystore 保密，仅 CI 期存在）
-android_version/dist/
-android_version/release.keystore
-
 # 本地记忆（不发布）
 .workbuddy/
 
