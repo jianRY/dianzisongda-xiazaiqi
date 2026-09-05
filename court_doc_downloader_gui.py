@@ -45,6 +45,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 import urllib.error
 import urllib.request
 
+import autoupdate
+
 API_URL = "https://zxfw.court.gov.cn/yzw/yzw-zxfw-sdfw/api/v1/sdfw/getWsListBySdbhNew"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -53,7 +55,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.3"
+VERSION = "1.4"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -195,38 +197,6 @@ def download_file(url, path, ctx, cancel_check=None):
     raise RuntimeError("下载失败（已重试 %d 次）：%s" % (MAX_RETRY, last_err))
 
 
-def _parse_version(v):
-    """把 'v1.2.3' / '1.2' 解析成可按元组比较的数字序列。"""
-    v = v.strip().lstrip("vV")
-    parts = re.split(r"[.\-]", v)
-    out = []
-    for p in parts:
-        m = re.match(r"\d+", p)
-        out.append(int(m.group()) if m else 0)
-    return tuple(out)
-
-
-def _version_greater(remote, local):
-    try:
-        return _parse_version(remote) > _parse_version(local)
-    except Exception:
-        return False
-
-
-def download_generic(url, path, timeout=120):
-    """通用下载（更新用），不做文件类型校验。自动继承系统代理环境变量。"""
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA}, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        with open(path, "wb") as f:
-            while True:
-                buf = resp.read(65536)
-                if not buf:
-                    break
-                f.write(buf)
-    if os.path.getsize(path) == 0:
-        raise IOError("下载到 0 字节")
-
-
 def sanitize_filename(name):
     name = name.strip()
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
@@ -318,7 +288,8 @@ def config_path():
 
 
 def load_config():
-    cfg = {"out_dir": "", "auto_open_mode": 0, "convert_jpg": False, "jpg_mode": 0}
+    cfg = {"out_dir": "", "auto_open_mode": 0, "convert_jpg": False, "jpg_mode": 0,
+           "auto_update": True}
     try:
         with open(config_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -333,6 +304,7 @@ def load_config():
         jm = data.get("jpg_mode", None)
         if jm in (0, 1):
             cfg["jpg_mode"] = jm
+        cfg["auto_update"] = bool(data.get("auto_update", True))
     except Exception:
         pass
     if not cfg["out_dir"]:
@@ -340,7 +312,7 @@ def load_config():
     return cfg
 
 
-def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode):
+def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=True):
     try:
         p = config_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -350,6 +322,7 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode):
                 "auto_open_mode": int(auto_open_mode),
                 "convert_jpg": bool(convert_jpg),
                 "jpg_mode": int(jpg_mode),
+                "auto_update": bool(auto_update),
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -490,9 +463,9 @@ class App:
         except Exception:
             pass
 
-        # 启动时自动检查更新（静默，无更新不打扰）
+        # 启动时自动检查更新（静默；有新版才弹「更新内容 + 三选项」对话框）
         try:
-            threading.Thread(target=self.check_update, kwargs={"silent": True}, daemon=True).start()
+            self.startup_update_check()
         except Exception:
             pass
 
@@ -703,9 +676,11 @@ class App:
             "   · 每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
             "     防止同名法院不同链接的文件被合并。\n\n"
             "————————— 自动更新 —————————\n"
-            "· 程序启动时会自动静默检查更新，有新版会弹窗提示。\n"
-            "· 也可点菜单「更新 → 检查更新」手动检查。\n"
-            "· 确认更新后会自动下载新程序、替换旧文件并重启。\n\n"
+            "· 程序启动时会自动检查更新，发现新版会弹窗显示本次更新内容。\n"
+            "· 弹窗三选：✅ 立即更新 / ⏭ 本次忽略 / 🚫 以后不再提醒。\n"
+            "  选「以后不再提醒」后启动不再自动检查（菜单里仍可手动检查）。\n"
+            "· 确认更新后显示下载进度与速度，可随时取消。\n"
+            "· 下载完成后自动替换旧程序并重启。\n\n"
             "————————— 常见问题 —————————\n"
             "Q：提示下载失败 / 链接无效？\n"
             "A：电子送达链接有时效，请重新从法院短信复制最新链接再试。\n\n"
@@ -730,93 +705,32 @@ class App:
             "仅供本人依法处理诉讼事务使用。" % VERSION,
         )
 
-    # ---- 自动检查更新 ----
-    def check_update(self, silent=False):
-        """检查 GitHub 最新 Release。silent=True 用于启动静默检查（无更新不打扰）。"""
-        try:
-            req = urllib.request.Request(
-                GITHUB_API_LATEST,
-                headers={"User-Agent": BROWSER_UA, "Accept": "application/vnd.github+json"},
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            tag = data.get("tag_name", "")
-            dl = None
-            for a in data.get("assets", []):
-                if a.get("name", "").lower().endswith(".exe"):
-                    dl = a.get("browser_download_url")
-                    break
-            notes = data.get("body", "") or ""
-            if not dl:
-                if not silent:
-                    self.root.after(0, lambda: messagebox.showinfo("检查更新", "未找到可用的更新文件。"))
-                return
-            if _version_greater(tag, VERSION):
-                self.root.after(0, lambda: self._prompt_update(tag, dl, notes))
-            elif not silent:
-                self.root.after(0, lambda: messagebox.showinfo("检查更新", "已是最新版本 v%s。" % VERSION))
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403, 404):
-                msg = "无法自动检查更新：该仓库 / Release 为私有或不可见，需将其设为公开后才能免密自动下载。可前往 GitHub 手动下载。"
-            else:
-                msg = "检查更新失败（HTTP %d）。" % e.code
-            if not silent:
-                self.root.after(0, lambda m=msg: messagebox.showwarning("检查更新", m))
-        except Exception as e:  # noqa: BLE001
-            if not silent:
-                self.root.after(0, lambda: messagebox.showwarning("检查更新", "检查更新失败：%s" % e))
-
+    # ---- 自动检查更新（通用模块 autoupdate 承担 UI 与下载） ----
     def check_update_manual(self):
-        self.check_update(silent=False)
+        """菜单/按钮手动检查：不受「以后不再提醒」开关影响。"""
+        autoupdate.run_update_check(
+            self.root,
+            app_name="法院文书下载器",
+            current_version=VERSION,
+            latest_api_url=GITHUB_API_LATEST,
+            config_file=config_path(),
+            install_helper=autoupdate.windows_replace_and_restart,
+            log_fn=self.log_msg,
+            manual=True,
+        )
 
-    def _prompt_update(self, tag, dl_url, notes):
-        info = "发现新版本 %s（当前 v%s）。\n\n是否立即下载并更新？" % (tag, VERSION)
-        if notes.strip():
-            info += "\n\n更新内容：\n" + notes.strip()[:600]
-        if messagebox.askyesno("发现新版本", info):
-            self._do_update(dl_url)
-
-    def _do_update(self, dl_url):
-        self.log_msg("开始下载更新…")
-        tmp = os.path.join(tempfile.gettempdir(), "法院文书下载器_更新.exe")
-        try:
-            download_generic(dl_url, tmp, timeout=180)
-        except Exception as e:  # noqa: BLE001
-            self.log_msg("✗ 更新下载失败：%s" % e)
-            self.root.after(0, lambda: messagebox.showerror("更新失败", "下载新版本失败：%s" % e))
-            return
-        if os.path.getsize(tmp) < 100000:
-            self.log_msg("✗ 下载文件过小，疑似失败")
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            return
-        current = os.path.abspath(sys.executable)
-        self.log_msg("下载完成，准备重启并替换旧程序…")
-        bat = os.path.join(tempfile.gettempdir(), "法院文书下载器_updater.bat")
-        cur = current.replace("/", "\\")
-        tmpn = tmp.replace("/", "\\")
-        try:
-            with open(bat, "w", encoding="gbk") as f:
-                f.write("@echo off\n")
-                f.write(":wait\n")
-                f.write("timeout /t 1 /nobreak >nul\n")
-                f.write('del /f /q "%s"\n' % cur)
-                f.write('if exist "%s" goto wait\n' % cur)
-                f.write('move /y "%s" "%s"\n' % (tmpn, cur))
-                f.write('start "" "%s"\n' % cur)
-                f.write('del /f /q "%~f0"\n')
-        except Exception as e:  # noqa: BLE001
-            self.log_msg("✗ 生成更新脚本失败：%s" % e)
-            return
-        try:
-            subprocess.Popen(["cmd", "/c", bat], shell=False)
-        except Exception as e:  # noqa: BLE001
-            self.log_msg("✗ 启动更新失败：%s" % e)
-            return
-        self.root.destroy()
+    def startup_update_check(self):
+        """启动静默检查：发现新版弹「更新内容 + 三选项」对话框。"""
+        autoupdate.run_update_check(
+            self.root,
+            app_name="法院文书下载器",
+            current_version=VERSION,
+            latest_api_url=GITHUB_API_LATEST,
+            config_file=config_path(),
+            install_helper=autoupdate.windows_replace_and_restart,
+            log_fn=self.log_msg,
+            manual=False,
+        )
 
     def on_start(self):
         if self.running:
