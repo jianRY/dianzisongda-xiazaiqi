@@ -55,11 +55,80 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.5"
+VERSION = "1.6"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
 GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/releases/latest"
+
+# ---------------- 应用图标 ----------------
+# 图标资源相对路径（打包进 exe 的 _MEIPASS 内同样位于 assets/ 下）
+APP_ICON_REL = os.path.join("assets", "app.ico")
+# Windows 任务栏身份标识：不设置的话任务栏会显示 python 默认图标
+APP_ID = "jianRY.CourtDocDownloader"
+
+
+def resource_path(rel):
+    """定位打包进 exe 的资源；PyInstaller 单文件运行时资源解包在 sys._MEIPASS。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+def setup_app_id():
+    """设置 Windows AppUserModelID，让任务栏用本程序的图标与身份。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
+
+
+def apply_window_icon(win):
+    """给窗口设置图标（标题栏 + 任务栏）。缺图标时静默跳过，不影响主功能。
+
+    注意：Tk 的 wm iconbitmap 在 Windows 上会取 .ico 里最小的一档（16px）再放大，
+    标题栏和任务栏都会发虚。这里在其后用 Win32 LoadImage 显式取 32px 档覆盖，
+    清晰度差别肉眼可见。
+    """
+    ico = resource_path(APP_ICON_REL)
+    if not os.path.isfile(ico):
+        return
+    # 1) Tk 常规方式（非 Windows 平台靠它；同时把图标属性挂上）
+    try:
+        win.iconbitmap(ico)
+    except Exception:
+        pass
+    # 2) Windows：显式指定尺寸设置 WM_SETICON，取高分辨率档位
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        LR_LOADFROMFILE = 0x0010
+        IMAGE_ICON = 1
+        WM_SETICON = 0x0080
+        ICON_SMALL, ICON_BIG = 0, 1
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                      ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = ctypes.c_void_p
+        win.update_idletasks()
+        hwnd = user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        if not hwnd:
+            return
+        big = user32.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+        small = user32.LoadImageW(None, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        if big:
+            user32.SendMessageW(hwnd, WM_SETICON, ctypes.c_void_p(ICON_BIG), ctypes.c_void_p(big))
+        if small:
+            user32.SendMessageW(hwnd, WM_SETICON, ctypes.c_void_p(ICON_SMALL), ctypes.c_void_p(small))
+    except Exception:
+        pass
 
 
 # ---------------- 核心下载逻辑（与命令行版一致） ----------------
@@ -397,6 +466,7 @@ class App:
         root.title("法院文书下载器 v" + VERSION)
         root.geometry("640x690")
         root.resizable(True, True)
+        apply_window_icon(root)
         # 窗口关闭保护：下载中先确认并置取消信号，避免半途强杀留下半成品文件
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -698,6 +768,7 @@ class App:
         win.title("使用说明 · 法院文书下载器 v" + VERSION)
         win.geometry("660x560")
         win.resizable(True, True)
+        apply_window_icon(win)
         try:
             win.transient(self.root)
         except Exception:
@@ -1031,6 +1102,7 @@ class App:
 
 
 def main():
+    setup_app_id()
     root = tk.Tk()
     App(root)
     root.mainloop()
