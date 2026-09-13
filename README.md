@@ -2,12 +2,13 @@
 
 全国法院统一送达平台电子送达文书自动下载工具。粘贴送达短信或链接，自动提取该案件全部文书并下载为 PDF，支持**多线程并发下载**、批量、转 JPG、防合并命名、自动更新（含更新内容展示 / 三选项 / 进度速度 / 随时取消）。
 
-## 功能特性（v1.5）
+## 功能特性（v1.6）
 
 - 自动识别 `zxfw.court.gov.cn` 送达链接（支持整段短信 / 一次粘贴多个链接批量下载）
 - **准确提取标准案号**（如 `(2025)苏0505民初7780号`），批量多案件时按位置就近配对，不会张冠李戴
 - 免登录调用文书清单接口，**同一案件多份文书用 4 线程并发下载**，速度更快
 - 图形界面（Tkinter）：粘贴 / 开始下载 / 实时进度条（份数+百分比） / 下载日志
+- **专属应用图标**（深蓝底金天平）：exe 文件图标、窗口标题栏、任务栏图标统一，不再显示 Python 默认图标
 - 下载中按钮自动切换为「取消下载」，可中途取消未完成任务（已完成文件保留）
 - **下载完整性校验**：比对 Content-Length，截断的坏文件自动重试
 - **跳过已存在的同名文书**（默认开启）：同一案件重复下载不重复拉取
@@ -36,7 +37,9 @@ python court_doc_downloader_gui.py
 ### 自行打包为单文件 exe
 ```bash
 pip install pyinstaller pymupdf
-pyinstaller --onefile --windowed --noupx --hidden-import=fitz --name CourtDocDownloader court_doc_downloader_gui.py
+pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
+  --icon assets/app.ico --add-data "assets/app.ico;assets" \
+  --name CourtDocDownloader court_doc_downloader_gui.py
 ```
 产物 `dist/CourtDocDownloader.exe` 重命名为 `法院文书下载器.exe` 即可。
 
@@ -44,10 +47,11 @@ pyinstaller --onefile --windowed --noupx --hidden-import=fitz --name CourtDocDow
 
 | 文件 | 说明 |
 | --- | --- |
-| `court_doc_downloader_gui.py` | 图形界面主程序（v1.5） |
+| `court_doc_downloader_gui.py` | 图形界面主程序（v1.6） |
 | `autoupdate.py` | 通用自动更新模块（三行接入，可复用到其他 Tkinter 软件） |
 | `court_doc_downloader.py` | 命令行版（零依赖，仅标准库 urllib） |
 | `CourtDocDownloader.spec` | PyInstaller 打包配置 |
+| `assets/app.ico` | 应用图标（16~256 共 7 种尺寸） |
 | `CHANGELOG.md` | 版本更新记录 |
 
 ## 技术说明
