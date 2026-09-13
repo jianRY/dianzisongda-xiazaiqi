@@ -55,7 +55,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.6"
+VERSION = "1.7"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -575,9 +575,23 @@ class App:
         except Exception:
             pass
 
+        # 若本程序是由更新流程启动的，接管原文件名并清掉旧版文件。
+        # 旧进程刚退出时文件可能还被锁着，模块内部会重试；放后台线程，不拖慢启动。
+        try:
+            threading.Thread(target=self._settle_after_update, daemon=True).start()
+        except Exception:
+            pass
+
         # 启动时自动检查更新（静默；有新版才弹「更新内容 + 三选项」对话框）
         try:
             self.startup_update_check()
+        except Exception:
+            pass
+
+    def _settle_after_update(self):
+        """更新后首次启动：接管程序文件名 + 清理旧版文件；失败不影响使用。"""
+        try:
+            autoupdate.settle_after_update(log_fn=self.log_msg)
         except Exception:
             pass
 
@@ -805,7 +819,9 @@ class App:
             "· 弹窗三选：✅ 立即更新 / ⏭ 本次忽略 / 🚫 以后不再提醒。\n"
             "  选「以后不再提醒」后启动不再自动检查（菜单里仍可手动检查）。\n"
             "· 确认更新后显示下载进度与速度，可随时取消。\n"
-            "· 下载完成后自动替换旧程序并重启。\n\n"
+            "· 下载完成后新版本直接放进本程序所在文件夹，自动重启，\n"
+            "  并删掉旧版本文件；程序文件名保持不变，桌面快捷方式继续可用。\n"
+            "  请把程序放在有写入权限的位置（如桌面），放在只读目录里无法自动更新。\n\n"
             "————————— 常见问题 —————————\n"
             "Q：提示下载失败 / 链接无效？\n"
             "A：电子送达链接有时效，请重新从法院短信复制最新链接再试。\n\n"
@@ -860,7 +876,7 @@ class App:
         )
 
     def _before_install(self):
-        """替换脚本就绪、程序即将退出前的收尾：停掉下载并保存配置。"""
+        """新版本已就位、程序即将退出前的收尾：停掉下载并保存配置。"""
         try:
             self.stop_event.set()
         except Exception:  # noqa: BLE001
