@@ -144,21 +144,40 @@ def fetch_latest_release(api_url, timeout=15):
 
 # ---------------- Windows 自替换重启 ----------------
 def windows_replace_and_restart(new_exe_path, log_fn=None):
-    """生成 updater.bat：等当前进程退出 → 替换 → 重启 → 自删。"""
+    """生成 updater.bat：等当前进程退出 → 删旧版 → 新版落位 → 重启 → 脚本自删。
+
+    为什么需要 bat：Windows 会锁定「正在运行」的 exe，程序无法在运行中删除自己，
+    所以「删除旧版本」必须推迟到自己退出之后，由这个几秒寿命的脚本代劳。
+    """
     current = os.path.abspath(sys.executable)
     bat = os.path.join(tempfile.gettempdir(), "%s_updater.bat" % re.sub(r"\W+", "_", new_exe_path)[:40])
     cur = current.replace("/", "\\")
     tmp = new_exe_path.replace("/", "\\")
     with open(bat, "w", encoding="gbk") as f:
         f.write("@echo off\n")
+        # 最多等 60 秒：若主程序迟迟不退出（异常/弹窗未关），不能让脚本永久空转
+        f.write("set /a n=0\n")
         f.write(":wait\n")
-        f.write("timeout /t 1 /nobreak >nul\n")
-        f.write('del /f /q "%s"\n' % cur)
-        f.write('if exist "%s" goto wait\n' % cur)
+        # ping 延迟 1 秒：timeout 命令在无控制台 stdin（--windowed exe）下会报
+        # "Input redirection is not supported" 而失效，ping 不依赖 stdin。
+        f.write("ping -n 2 127.0.0.1 >nul\n")
+        f.write("set /a n+=1\n")
+        f.write('if not exist "%s" goto done\n' % cur)
+        f.write("if %n% geq 60 goto failed\n")
+        f.write("goto wait\n")
+        f.write(":failed\n")
+        # 60 秒仍占用：不删旧版（保证程序可用），把新版留在临时目录供手动替换
+        f.write('echo [updater] 旧程序仍在运行，未替换。新版位置：%s\n' % tmp)
+        f.write("timeout /t 8 >nul 2>nul\n")
+        f.write("goto end\n")
+        f.write(":done\n")
         f.write('move /y "%s" "%s"\n' % (tmp, cur))
         f.write('start "" "%s"\n' % cur)
+        f.write(":end\n")
         f.write('del /f /q "%~f0"\n')
-    subprocess.Popen(["cmd", "/c", bat], shell=False)
+    # CREATE_NO_WINDOW：windowed exe 启动 cmd 会闪黑框，压掉它
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(["cmd", "/c", bat], shell=False, creationflags=flags)
     try:
         if log_fn:
             log_fn("✓ 更新脚本已启动，程序即将退出并替换…")
@@ -166,10 +185,30 @@ def windows_replace_and_restart(new_exe_path, log_fn=None):
         pass
 
 
+# ---------------- 窗口居中工具 ----------------
+def _center_on(master, w, h):
+    """相对 master 居中；master 尺寸还没算出来时退化为屏幕居中，避免弹窗跑到屏幕角落。"""
+    try:
+        master.update_idletasks()
+        mw, mh = master.winfo_width(), master.winfo_height()
+        if mw > 1 and mh > 1:
+            return (max(master.winfo_rootx() + (mw - w) // 2, 0),
+                    max(master.winfo_rooty() + (mh - h) // 3, 0))
+        sw, sh = master.winfo_screenwidth(), master.winfo_screenheight()
+        return (max((sw - w) // 2, 0), max((sh - h) // 3, 0))
+    except Exception:  # noqa: BLE001
+        return (60, 60)
+
+
 # ---------------- 主入口 ----------------
 def run_update_check(parent, app_name, current_version, latest_api_url, config_file,
-                     install_helper=None, log_fn=None, manual=False):
-    """启动检查（后台线程）。manual=True 时失败/无更新也弹提示，且忽略 auto_update 开关。"""
+                     install_helper=None, log_fn=None, manual=False,
+                     on_before_install=None):
+    """启动检查（后台线程）。manual=True 时失败/无更新也弹提示，且忽略 auto_update 开关。
+
+    on_before_install: 可选回调。替换脚本已就绪、程序即将退出前调用，
+                       宿主可在此保存状态 / 销毁窗口，确保进程真正退出（否则替换脚本会空等）。
+    """
     if install_helper is None:
         install_helper = windows_replace_and_restart
 
@@ -211,6 +250,7 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
             tag=tag, notes=info.get("notes", ""),
             download_url=info["download_url"],
             config_file=config_file, install_helper=install_helper, log_fn=log_fn,
+            on_before_install=on_before_install,
         ))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -219,7 +259,8 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
 # ---------------- 更新确认弹窗（三选项） ----------------
 class UpdateDialog(tk.Toplevel):
     def __init__(self, master, app_name, current_version, tag, notes,
-                 download_url, config_file, install_helper, log_fn=None):
+                 download_url, config_file, install_helper, log_fn=None,
+                 on_before_install=None):
         super().__init__(master)
         self.title("发现新版本 · %s" % app_name)
         self.configure(bg="#f4f6f8")
@@ -234,6 +275,7 @@ class UpdateDialog(tk.Toplevel):
         self._config_file = config_file
         self._install_helper = install_helper
         self._log_fn = log_fn
+        self._on_before_install = on_before_install
 
         frm = ttk.Frame(self, padding=(16, 14))
         frm.pack(fill="both", expand=True)
@@ -270,9 +312,8 @@ class UpdateDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_skip)
         self.update_idletasks()
         w, h = 560, max(340, self.winfo_reqheight())
-        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - h) // 3
-        self.geometry("%dx%d+%d+%d" % (w, h, max(x, 0), max(y, 0)))
+        x, y = _center_on(master, w, h)
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     def _close(self):
         try:
@@ -287,6 +328,7 @@ class UpdateDialog(tk.Toplevel):
             self.master, app_name=self._app_name,
             download_url=self._download_url,
             install_helper=self._install_helper, log_fn=self._log_fn,
+            on_before_install=self._on_before_install,
         )
 
     def _on_skip(self):
@@ -313,7 +355,8 @@ class DownloadProgressDialog(tk.Toplevel):
 
     POLL_MS = 150
 
-    def __init__(self, master, app_name, download_url, install_helper, log_fn=None):
+    def __init__(self, master, app_name, download_url, install_helper, log_fn=None,
+                 on_before_install=None):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
         self.configure(bg="#f4f6f8")
@@ -327,6 +370,7 @@ class DownloadProgressDialog(tk.Toplevel):
         self._app_name = app_name
         self._install_helper = install_helper
         self._log_fn = log_fn
+        self._on_before_install = on_before_install
 
         self._cancel_evt = threading.Event()
         self._state = {"done": 0, "total": 0, "running": True,
@@ -352,9 +396,8 @@ class DownloadProgressDialog(tk.Toplevel):
 
         self.update_idletasks()
         w = 460
-        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - 190) // 3
-        self.geometry("%dx%d+%d+%d" % (w, 190, max(x, 0), max(y, 0)))
+        x, y = _center_on(master, w, 190)
+        self.geometry("%dx%d+%d+%d" % (w, 190, x, y))
 
         threading.Thread(target=self._worker, daemon=True).start()
         self.after(self.POLL_MS, self._poll)
@@ -474,3 +517,39 @@ class DownloadProgressDialog(tk.Toplevel):
             self._install_helper(done_path, self._log_fn)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("更新失败", "启动更新程序失败：%s" % e)
+            return
+        # 替换脚本已在后台等待本进程退出。必须真正退出，否则脚本会空等到超时，
+        # 更新不会生效（这正是「点了更新却没变化」的根因）。
+        try:
+            if self._on_before_install:
+                self._on_before_install()
+        except Exception:  # noqa: BLE001
+            pass
+        self._exit_app()
+
+    def _exit_app(self):
+        """关闭主窗口并结束进程，让替换脚本得以删旧换新。"""
+        master = self.master
+        try:
+            messagebox.showinfo(
+                "更新就绪",
+                "新版本已下载完成，程序将自动关闭并完成替换，随后自动重启。",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            master.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        # 兜底：销毁窗口后 mainloop 通常已退出；若仍有残留线程/阻塞，强制退出
+        def _force():
+            try:
+                master.quit()
+            except Exception:  # noqa: BLE001
+                pass
+            os._exit(0)
+        try:
+            root = master.winfo_toplevel()
+            root.after(400, _force)
+        except Exception:  # noqa: BLE001
+            _force()
