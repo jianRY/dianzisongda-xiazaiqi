@@ -69,7 +69,12 @@ def parse_params(text):
     if not (qdbh and sdbh and sdsin):
         return None
     # 顺便尝试从短信正文里抠出标准案号，例如 (2025)苏0505民初7780号
-    m = re.search(r"[\(（](\d{4})[\)）][一-龥A-Za-z]+?(?:民|刑|行|执|商)[初终再申保]?\w*?\d+号", text)
+    # 结构：[年度] + 法院代字(汉字+可选数字) + 案件类型 + 程序 + 序号 + 号
+    m = re.search(
+        r"[\(（](\d{4})[\)）]\s*[一-龥]{1,6}\d{0,6}\s*"
+        r"(?:民|刑|行|执|商|赔|认)[初终再申保特监破执异复撤销核催督催告]?\s*\d+\s*号",
+        text,
+    )
     caseno = m.group(0) if m else ""
     return {
         "qdbh": qdbh.group(1),

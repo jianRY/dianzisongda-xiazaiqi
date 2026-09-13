@@ -55,7 +55,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.4"
+VERSION = "1.5"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -63,22 +63,40 @@ GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/r
 
 
 # ---------------- 核心下载逻辑（与命令行版一致） ----------------
+# 标准案号，如 (2025)苏0505民初7780号 / （2025）苏05民终1234号
+# 结构：[年度] + 法院代字(汉字+可选数字) + 案件类型(民/刑/行/执/商) + 程序(初/终/再/申/保/特/监/破…) + 序号 + 号
 _CASE_RE = re.compile(
-    r"[\(（](\d{4})[\)）][一-龥A-Za-z]+?(?:民|刑|行|执|商)[初终再申保]?\w*?\d+号"
+    r"[\(（](\d{4})[\)）]\s*[一-龥]{1,6}\d{0,6}\s*"
+    r"(?:民|刑|行|执|商|赔|认)[初终再申保特监破执异复撤销核催督催告]?\s*\d+\s*号"
 )
 
 
-def _extract_one(url, text, pos):
+def _extract_one(url, text, pos, case_spans=None):
+    """从单个 url 提取参数。
+
+    case_spans: 预先算好的 [(start, end, caseno), ...]，按案号在文本中的位置排序。
+    优先取「紧跟在该链接之前」的最近案号；没有则回退到全局第一个案号。
+    这样批量粘贴多案件时才不会把 B 案的案号安到 A 案头上。
+    """
     q = re.search(r"[?&]qdbh=([^&\s]+)", url)
     s1 = re.search(r"[?&]sdbh=([^&\s]+)", url)
     s2 = re.search(r"[?&]sdsin=([^&\s]+)", url)
     if not (q and s1 and s2):
         return None
     caseno = ""
-    if pos is not None:
-        seg = text[max(0, pos - 140): pos + 40]
-        cm = _CASE_RE.search(seg)
-        caseno = cm.group(0) if cm else ""
+    if case_spans:
+        # 取链接位置之前最近的一个案号（同一条短信通常是「案号…链接」的顺序）
+        for st, en, cn in case_spans:
+            if en <= pos:
+                caseno = cn
+            elif st > pos:
+                break
+        if not caseno:
+            # 链接在前、案号在后（少数短信格式）：取之后最近的一个
+            for st, en, cn in case_spans:
+                if st >= pos:
+                    caseno = cn
+                    break
     if not caseno:
         cm = _CASE_RE.search(text)
         caseno = cm.group(0) if cm else ""
@@ -95,10 +113,13 @@ def extract_tasks(text):
     """从文本中提取所有送达链接（支持批量、自动去重）。"""
     tasks = []
     seen = set()
+    # 先扫描全文所有案号及其位置，供 _extract_one 按就近原则配对
+    case_spans = [(m.start(), m.end(), m.group(0)) for m in _CASE_RE.finditer(text)]
+    case_spans.sort()
     url_re = re.compile(r"https?://[^\s\"'<>）) ]+")
     for m in url_re.finditer(text):
         url = m.group(0).rstrip(".,;:)%）) ")
-        t = _extract_one(url, text, m.start())
+        t = _extract_one(url, text, m.start(), case_spans)
         if not t:
             continue
         key = (t["qdbh"], t["sdbh"], t["sdsin"])
@@ -162,16 +183,25 @@ def download_file(url, path, ctx, cancel_check=None):
                 method="GET",
             )
             with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+                # 记录服务端声明的长度，下载完比对，防止网络中断留下「文件头正常但内容被截断」的坏 PDF
+                try:
+                    expect = int(resp.headers.get("Content-Length", 0) or 0)
+                except (TypeError, ValueError):
+                    expect = 0
+                written = 0
                 with open(path, "wb") as f:
                     while True:
                         if cancel_check and cancel_check():
                             raise _Cancelled()
-                        buf = resp.read(4096)
+                        buf = resp.read(65536)
                         if not buf:
                             break
                         f.write(buf)
+                        written += len(buf)
             if os.path.getsize(path) == 0:
                 raise IOError("下载到 0 字节")
+            if expect and written != expect:
+                raise IOError("下载不完整（%d / %d 字节），将重试" % (written, expect))
             with open(path, "rb") as f:
                 if f.read(5) != b"%PDF-":
                     os.remove(path)
@@ -289,7 +319,7 @@ def config_path():
 
 def load_config():
     cfg = {"out_dir": "", "auto_open_mode": 0, "convert_jpg": False, "jpg_mode": 0,
-           "auto_update": True}
+           "auto_update": True, "skip_existing": True}
     try:
         with open(config_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -305,6 +335,7 @@ def load_config():
         if jm in (0, 1):
             cfg["jpg_mode"] = jm
         cfg["auto_update"] = bool(data.get("auto_update", True))
+        cfg["skip_existing"] = bool(data.get("skip_existing", True))
     except Exception:
         pass
     if not cfg["out_dir"]:
@@ -312,7 +343,8 @@ def load_config():
     return cfg
 
 
-def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=True):
+def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=True,
+                skip_existing=True):
     try:
         p = config_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -323,6 +355,7 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=True
                 "convert_jpg": bool(convert_jpg),
                 "jpg_mode": int(jpg_mode),
                 "auto_update": bool(auto_update),
+                "skip_existing": bool(skip_existing),
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -355,18 +388,17 @@ class App:
         self.auto_open_mode = cfg.get("auto_open_mode", 0)
         self.convert_jpg = bool(cfg.get("convert_jpg", False))
         self.jpg_mode = cfg.get("jpg_mode", 0)
+        self.skip_existing = bool(cfg.get("skip_existing", True))
         self.last_case_dir = None
         self.running = False
         self.stop_event = threading.Event()  # 取消下载信号
         self._cancel_lock = threading.Lock()  # 保护 last_case_dir / 计数等共享状态
 
         root.title("法院文书下载器 v" + VERSION)
-        root.geometry("640x620")
+        root.geometry("640x690")
         root.resizable(True, True)
-        try:
-            root.iconbitmap()  # 无图标则忽略
-        except Exception:
-            pass
+        # 窗口关闭保护：下载中先确认并置取消信号，避免半途强杀留下半成品文件
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 顶部菜单栏
         self._build_menubar()
@@ -425,6 +457,16 @@ class App:
         ttk.Radiobutton(self.jpg_sub, text="按 PDF 文件名分别建文件夹",
                         variable=self.jpg_mode_var, value=JPG_MODE_PERPDF).pack(side="left", padx=8)
         self._sync_jpg_state()
+
+        # ⑤ 选项：跳过已存在的文件
+        skip_box = ttk.LabelFrame(root, text="重复下载处理")
+        skip_box.pack(fill="x", padx=12, pady=(2, 4))
+        self.skip_var = tk.BooleanVar(value=self.skip_existing)
+        self.skip_var.trace_add("write", self._on_skip_existing_changed)
+        ttk.Checkbutton(
+            skip_box, text="跳过已存在的同名文书（同一案件重复下载时省时省流量）",
+            variable=self.skip_var,
+        ).pack(anchor="w", padx=8, pady=(2, 4))
 
         # 开始按钮
         self.btn_start = ttk.Button(
@@ -493,23 +535,32 @@ class App:
     def reset_path(self):
         self.path_var.set(default_out_dir())
 
+    def _save_cfg(self):
+        """统一保存：一次写全所有配置项，避免各调用点漏参数。"""
+        save_config(self.out_dir, self.auto_open_mode, self.convert_jpg, self.jpg_mode,
+                    skip_existing=self.skip_existing)
+
     def _on_path_var_changed(self, *_):
         val = self.path_var.get().strip()
         if val:
             self.out_dir = val
-            save_config(self.out_dir, self.auto_open_mode, self.convert_jpg, self.jpg_mode)
+            self._save_cfg()
 
     def _on_auto_open_changed(self, *_):
         self.auto_open_mode = int(self.auto_open_var.get())
-        save_config(self.out_dir, self.auto_open_mode, self.convert_jpg, self.jpg_mode)
+        self._save_cfg()
 
     def _on_convert_changed(self, *_):
         self.convert_jpg = bool(self.convert_var.get())
-        save_config(self.out_dir, self.auto_open_mode, self.convert_jpg, self.jpg_mode)
+        self._save_cfg()
 
     def _on_jpg_mode_changed(self, *_):
         self.jpg_mode = int(self.jpg_mode_var.get())
-        save_config(self.out_dir, self.auto_open_mode, self.convert_jpg, self.jpg_mode)
+        self._save_cfg()
+
+    def _on_skip_existing_changed(self, *_):
+        self.skip_existing = bool(self.skip_var.get())
+        self._save_cfg()
 
     def _sync_jpg_state(self):
         # 未勾选“转 JPG”时，禁用目录模式单选
@@ -670,9 +721,12 @@ class App:
             "     - 模式一：所有图片放到一个「图片」文件夹；\n"
             "     - 模式二：按 PDF 文件名各自建子文件夹存放。\n"
             "     - 图片长边 2000 像素、高质量、短边自适应；多页自动加页码。\n"
+            "   · 重复下载处理：默认勾选「跳过已存在的同名文书」，\n"
+            "     同一案件重复下载时不再重复拉取（需强制重下就取消勾选）。\n"
             "4. 开始：点「⬇ 开始下载」，进度条实时显示「已下载 / 总份数 (百分比)」。\n"
             "   · 同一案件的多份文书会用 %d 个线程并发下载，速度更快。\n"
             "   · 下载过程中按钮变为「⏸ 取消下载」，点击可中途取消未完成任务。\n"
+            "   · 下载中直接关闭窗口会先询问，未完成文件会被清理。\n"
             "   · 每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
             "     防止同名法院不同链接的文件被合并。\n\n"
             "————————— 自动更新 —————————\n"
@@ -717,6 +771,7 @@ class App:
             install_helper=autoupdate.windows_replace_and_restart,
             log_fn=self.log_msg,
             manual=True,
+            on_before_install=self._before_install,
         )
 
     def startup_update_check(self):
@@ -730,7 +785,16 @@ class App:
             install_helper=autoupdate.windows_replace_and_restart,
             log_fn=self.log_msg,
             manual=False,
+            on_before_install=self._before_install,
         )
+
+    def _before_install(self):
+        """替换脚本就绪、程序即将退出前的收尾：停掉下载并保存配置。"""
+        try:
+            self.stop_event.set()
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.update()
 
     def on_start(self):
         if self.running:
@@ -786,6 +850,25 @@ class App:
             self.stop_event.set()
             self.log_msg("⏸ 收到取消请求，正在停止剩余任务…")
             self.btn_start.configure(state="disabled", text="正在取消…")
+
+    def on_close(self):
+        """关闭窗口：下载中先确认，并让 worker 有机会清理半成品文件。"""
+        if self.running:
+            if not messagebox.askyesno(
+                "确认退出",
+                "正在下载中，确定要退出吗？\n\n未完成的文件将被丢弃，已下载的部分会保留。",
+            ):
+                return
+            self.stop_event.set()
+            self.log_msg("⏸ 正在退出，等待当前下载任务收尾…")
+            # 给 worker 一点时间清理（最多约 1.5 秒），再关闭窗口
+            self._closing = True
+            self.root.after(1500, self._force_close)
+            return
+        self.root.destroy()
+
+    def _force_close(self):
+        self.root.destroy()
 
     def worker(self, tasks):
         ctx = ssl.create_default_context()
@@ -852,6 +935,11 @@ class App:
                     i_, d_, full_, raw_, ext_, base_name_ = job
                     if self.stop_event.is_set():
                         return (i_, raw_, "cancelled", None, full_)
+                    # 已存在同名文件跳过：重复下载同一案件时省时省流量
+                    # （需要重下时删掉旧文件再跑即可）
+                    if self.skip_existing and os.path.exists(full_) and os.path.getsize(full_) > 0:
+                        return (i_, raw_, "skip",
+                                "    ⏭ 已存在，跳过：%s" % os.path.basename(full_), full_)
                     self.log_msg("[%d/%d] 下载：%s" % (i_, len(docs), raw_))
                     try:
                         download_file(
@@ -889,6 +977,8 @@ class App:
                         self.log_msg(msg)
                         if status == "ok":
                             success += 1
+                        elif status == "skip":
+                            success += 1  # 已存在视为成功，不计入失败
                         elif status == "cancelled":
                             # 已取消：剩余 future 还在跑，等它们自己看到 stop_event 退出
                             pass

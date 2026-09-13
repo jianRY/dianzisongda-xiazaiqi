@@ -28,3 +28,6 @@ chunk_*
 # 保留预编译 exe（dist/法院文书下载器.exe）
 !dist/
 !dist/*.exe
+
+# 资料库上传中间物
+_project_upload/
