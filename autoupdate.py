@@ -4,14 +4,15 @@
 autoupdate.py — Tkinter 应用通用自动更新模块（零第三方依赖，仅标准库）
 =====================================================================
 
-功能（2026-09-05 定版，供所有带更新功能的软件复用）：
+功能（2026-09-13 改为「就地更新」，供所有带更新功能的软件复用）：
     1. 启动后台检查 GitHub Latest Release（静默，失败不打扰）
     2. 发现新版本 → 弹窗显示「更新内容」（取 Release body，自动清理 markdown 符号）
        三个选择：
          ✅ 立即更新   → 下载进度对话框（进度条 / 速度 / 已下载大小 / 随时取消）
          ⏭ 本次忽略   → 本次关闭，下次启动继续检查
          🚫 以后不再提醒 → 配置文件写 auto_update=false，启动不再自动检查
-    3. 下载完成 → 生成 updater 脚本自替换并重启（Windows bat 实现）
+    3. 下载完成 → 新版直接放进程序所在目录并接管原文件名，旧版由新版启动后删除
+       （不生成 bat、不做「等进程退出」的轮询，见 windows_replace_and_restart）
     4. 菜单/按钮手动「检查更新」不受 auto_update 开关影响（manual=True）
 
 接入方法（三行代码）：
@@ -40,6 +41,7 @@ Release 要求：
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,47 +144,200 @@ def fetch_latest_release(api_url, timeout=15):
     }
 
 
-# ---------------- Windows 自替换重启 ----------------
-def windows_replace_and_restart(new_exe_path, log_fn=None):
-    """生成 updater.bat：等当前进程退出 → 删旧版 → 新版落位 → 重启 → 脚本自删。
+# ---------------- 就地更新（Windows，不借助外部脚本） ----------------
+# 事实依据（2026-09-13 实测，Windows 10/11）：程序运行期间，它自己的 exe 文件
+#   · 不能删除        → PermissionError WinError 5
+#   · 不能被覆盖/替换 → PermissionError WinError 5
+#   · 但**可以被重命名**（同目录改名不受锁限制）
+# 因此「删掉旧版本」这件事必须推迟到进程退出之后，由接管的新版本去完成。
+# 这也是旧实现（生成 updater.bat + 轮询等待进程退出）失败的根源：轮询条件写错，
+# 永远等不到，最后走超时分支什么都不做。
 
-    为什么需要 bat：Windows 会锁定「正在运行」的 exe，程序无法在运行中删除自己，
-    所以「删除旧版本」必须推迟到自己退出之后，由这个几秒寿命的脚本代劳。
+
+def _is_frozen():
+    """是否以打包后的 exe 运行。开发态（python 跑 .py）绝不能碰 sys.executable 所在目录。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _base_stem(stem):
+    """去掉 _旧版[_时间戳] / _更新中[_序号] 后缀，还原出本程序的基准文件名。"""
+    return re.sub(r"_(?:旧版(?:_\d{14})?|更新中(?:_\d+)?)$", "", stem)
+
+
+def _old_version_pattern(base_stem, ext):
+    """只匹配本程序自己产生的旧版/中间文件，避免误删同目录其他文件。"""
+    return re.compile(
+        r"^%s_(?:旧版(?:_\d{14})?|更新中(?:_\d+)?)%s$" % (re.escape(base_stem), re.escape(ext)),
+        re.IGNORECASE,
+    )
+
+
+def cleanup_old_versions(log_fn=None, max_wait=8.0):
+    """删除程序目录里遗留的「旧版 / 更新中」文件。
+
+    只在打包运行时生效；开发态直接返回，不做任何事。
+    命中规则严格限定为本程序自己的命名格式，且排除当前正在运行的自己。
+    刚启动时旧进程可能还没完全退出（文件仍被锁），所以带重试。
     """
-    current = os.path.abspath(sys.executable)
-    bat = os.path.join(tempfile.gettempdir(), "%s_updater.bat" % re.sub(r"\W+", "_", new_exe_path)[:40])
-    cur = current.replace("/", "\\")
-    tmp = new_exe_path.replace("/", "\\")
-    with open(bat, "w", encoding="gbk") as f:
-        f.write("@echo off\n")
-        # 最多等 60 秒：若主程序迟迟不退出（异常/弹窗未关），不能让脚本永久空转
-        f.write("set /a n=0\n")
-        f.write(":wait\n")
-        # ping 延迟 1 秒：timeout 命令在无控制台 stdin（--windowed exe）下会报
-        # "Input redirection is not supported" 而失效，ping 不依赖 stdin。
-        f.write("ping -n 2 127.0.0.1 >nul\n")
-        f.write("set /a n+=1\n")
-        f.write('if not exist "%s" goto done\n' % cur)
-        f.write("if %n% geq 60 goto failed\n")
-        f.write("goto wait\n")
-        f.write(":failed\n")
-        # 60 秒仍占用：不删旧版（保证程序可用），把新版留在临时目录供手动替换
-        f.write('echo [updater] 旧程序仍在运行，未替换。新版位置：%s\n' % tmp)
-        f.write("timeout /t 8 >nul 2>nul\n")
-        f.write("goto end\n")
-        f.write(":done\n")
-        f.write('move /y "%s" "%s"\n' % (tmp, cur))
-        f.write('start "" "%s"\n' % cur)
-        f.write(":end\n")
-        f.write('del /f /q "%~f0"\n')
-    # CREATE_NO_WINDOW：windowed exe 启动 cmd 会闪黑框，压掉它
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(["cmd", "/c", bat], shell=False, creationflags=flags)
+    if not _is_frozen():
+        return []
     try:
-        if log_fn:
-            log_fn("✓ 更新脚本已启动，程序即将退出并替换…")
-    except Exception:
-        pass
+        current = os.path.abspath(sys.executable)
+    except Exception:  # noqa: BLE001
+        return []
+    return _purge(directory=os.path.dirname(current), current=current,
+                  log_fn=log_fn, max_wait=max_wait)
+
+
+def _purge(directory, current, log_fn=None, max_wait=8.0):
+    """删除 directory 下所有「本程序旧版/中间」文件（排除 current）。"""
+    stem, ext = os.path.splitext(os.path.basename(current))
+    pat = _old_version_pattern(_base_stem(stem), ext)
+
+    def _scan():
+        found = []
+        try:
+            for name in os.listdir(directory):
+                full = os.path.join(directory, name)
+                if pat.match(name) and os.path.abspath(full).lower() != current.lower():
+                    found.append(full)
+        except OSError:
+            pass
+        return found
+
+    removed, deadline = [], time.time() + max_wait
+    while True:
+        left = []
+        for p in _scan():
+            try:
+                os.remove(p)
+                removed.append(os.path.basename(p))
+            except OSError:
+                left.append(p)
+        if not left or time.time() >= deadline:
+            break
+        time.sleep(0.6)
+
+    if removed and log_fn:
+        try:
+            log_fn("已清理旧版本文件：%s" % "、".join(removed))
+        except Exception:  # noqa: BLE001
+            pass
+    return removed
+
+
+def settle_after_update(log_fn=None):
+    """程序启动时调用：接管原文件名，并清掉更新过程留下的旧版文件。
+
+    只在打包运行时生效。所谓「接管」：如果自己是以中间名（xxx_更新中.exe）
+    启动的，就把旧的 xxx.exe 挪开、把自己改名为 xxx.exe，让用户看到的文件名始终不变。
+
+    为什么新版要先用中间名启动，而不是直接顶替原文件名：
+        实测（Windows 10/11 + PyInstaller onefile）**无法在「当前运行进程自己的
+        映像路径」上启动新进程** —— 引导器进程起得来，但真实程序起不来，
+        表现为「程序关了却没有新窗口」。换个名字或换个目录都能正常启动。
+    """
+    if not _is_frozen():
+        return []
+    try:
+        current = os.path.abspath(sys.executable)
+    except Exception:  # noqa: BLE001
+        return []
+
+    def _log(m):
+        try:
+            if log_fn:
+                log_fn(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+    directory = os.path.dirname(current)
+    stem, ext = os.path.splitext(os.path.basename(current))
+    base = _base_stem(stem)
+    final = os.path.join(directory, base + ext)
+
+    # ① 接管文件名：自己叫中间名时，把旧版挪开（运行中的 exe 允许改名），自己顶上
+    if os.path.abspath(current).lower() != os.path.abspath(final).lower():
+        parked = os.path.join(directory, "%s_旧版%s" % (base, ext))
+        try:
+            if os.path.exists(final):
+                os.rename(final, parked)
+            os.rename(current, final)
+            _log("已接管程序文件名：%s" % os.path.basename(final))
+        except OSError as e:  # noqa: BLE001
+            _log("暂未能接管文件名（旧版本可能仍在运行）：%s" % e)
+
+    # ② 清掉所有旧版/中间残留（含刚被挪开的那份，旧进程退出后即可删除）
+    return _purge(directory, current, log_fn=log_fn, max_wait=12.0)
+
+
+def windows_replace_and_restart(new_exe_path, log_fn=None):
+    """就地更新：把下载好的新 exe 放进程序目录，启动它，本进程退出。
+
+    步骤（全在本进程内完成，不生成任何外部脚本、不做进程退出轮询）：
+        ① 新 exe 搬进程序目录，暂用中间名 xxx_更新中.exe
+        ② 以中间名启动它（**不能**用原文件名，见 settle_after_update 里的说明）
+        ③ 本进程退出；新版启动后由 settle_after_update() 接管原文件名并删掉旧版
+
+    new_exe_path: 下载好的新版 exe 路径（通常位于临时目录）。
+    失败时抛 RuntimeError，调用方负责提示。下载失败时文件原封不动。
+    """
+    if not _is_frozen():
+        raise RuntimeError(
+            "当前是开发态运行（未打包），无法执行就地更新。请在打包后的 exe 中测试。")
+
+    current = os.path.abspath(sys.executable)
+    directory = os.path.dirname(current)
+    stem, ext = os.path.splitext(os.path.basename(current))
+    base = _base_stem(stem)
+    staging = os.path.join(directory, "%s_更新中%s" % (base, ext))
+    # 自己就是以中间名在运行（上次接管尚未完成）时，必须换个名字：
+    # 否则会试图覆盖正在运行的自身文件，必然失败。
+    if os.path.abspath(staging).lower() == current.lower():
+        staging = os.path.join(
+            directory, "%s_更新中_%d%s" % (base, int(time.time()) % 1000000, ext))
+
+    def _log(msg):
+        try:
+            if log_fn:
+                log_fn(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ① 新 exe 搬进程序目录（同分区是瞬时改名，跨分区则复制）
+    if os.path.abspath(new_exe_path).lower() != os.path.abspath(staging).lower():
+        try:
+            if os.path.exists(staging):
+                os.remove(staging)
+        except OSError:
+            pass
+        try:
+            shutil.move(new_exe_path, staging)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("无法把新版本写入程序目录（%s）：%s" % (directory, e))
+    _log("新版本已放入程序目录：%s" % os.path.basename(staging))
+
+    # ② 启动新版。用中间名（而非原文件名）启动：Windows 不允许在「当前进程自己的
+    #    映像路径」上启动新进程，用原名会静默失败（引导器起来、真实程序起不来）。
+    started = False
+    if hasattr(os, "startfile"):
+        try:
+            try:
+                os.startfile(staging, cwd=directory)
+            except TypeError:          # 旧版 Python 没有 cwd 参数
+                os.startfile(staging)
+            started = True
+        except Exception:  # noqa: BLE001
+            started = False
+    if not started:                     # 兜底：cmd start
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", staging], cwd=directory,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            started = True
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "新版本已放入程序目录，但自动启动失败，请手动双击 %s：%s" % (staging, e))
+    _log("已启动新版本（%s），本程序即将退出。" % os.path.basename(staging))
 
 
 # ---------------- 窗口居中工具 ----------------
@@ -206,8 +361,8 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
                      on_before_install=None):
     """启动检查（后台线程）。manual=True 时失败/无更新也弹提示，且忽略 auto_update 开关。
 
-    on_before_install: 可选回调。替换脚本已就绪、程序即将退出前调用，
-                       宿主可在此保存状态 / 销毁窗口，确保进程真正退出（否则替换脚本会空等）。
+    on_before_install: 可选回调。新版本已就位、程序即将退出前调用，
+                       宿主可在此停掉后台任务 / 保存状态 / 销毁窗口，确保进程真正退出。
     """
     if install_helper is None:
         install_helper = windows_replace_and_restart
@@ -512,14 +667,14 @@ class DownloadProgressDialog(tk.Toplevel):
                 except Exception:
                     pass
             return
-        # 成功 → 交给宿主安装（默认：自替换 + 重启）
+        # 成功 → 交给宿主安装（默认：就地落位 + 启动新版）
         try:
             self._install_helper(done_path, self._log_fn)
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("更新失败", "启动更新程序失败：%s" % e)
+            messagebox.showerror("更新失败", "更新未完成：%s" % e)
             return
-        # 替换脚本已在后台等待本进程退出。必须真正退出，否则脚本会空等到超时，
-        # 更新不会生效（这正是「点了更新却没变化」的根因）。
+        # 新版已就位并启动。本进程必须真正退出：既避免两个实例同时存在，
+        # 也为了释放旧版文件的锁，新版才能把它删掉。
         try:
             if self._on_before_install:
                 self._on_before_install()
@@ -528,15 +683,18 @@ class DownloadProgressDialog(tk.Toplevel):
         self._exit_app()
 
     def _exit_app(self):
-        """关闭主窗口并结束进程，让替换脚本得以删旧换新。"""
+        """关闭主窗口并结束进程。
+
+        新版此刻已接管原文件名并启动，本进程必须真正退出：一是让新版成为唯一实例，
+        二是释放对「旧版_<时间戳>.exe」的文件锁，新版才能删掉它。
+        这里不弹模态框——模态框要等用户点击，会让本进程迟迟不退出。
+        """
         master = self.master
-        try:
-            messagebox.showinfo(
-                "更新就绪",
-                "新版本已下载完成，程序将自动关闭并完成替换，随后自动重启。",
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        if self._log_fn:
+            try:
+                self._log_fn("新版本已就位，程序即将自动重启…")
+            except Exception:  # noqa: BLE001
+                pass
         try:
             master.destroy()
         except Exception:  # noqa: BLE001
