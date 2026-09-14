@@ -34,7 +34,6 @@ import re
 import ssl
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -55,7 +54,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.7"
+VERSION = "1.8"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -271,10 +270,19 @@ def download_file(url, path, ctx, cancel_check=None):
                 raise IOError("下载到 0 字节")
             if expect and written != expect:
                 raise IOError("下载不完整（%d / %d 字节），将重试" % (written, expect))
+            # 内容校验：
+            #  · 文书不一定是 PDF（法院也可能发 jpg / docx），所以只在 .pdf 上强制 %PDF- 魔数，
+            #    否则所有非 PDF 文书都会被误判失败并重试 3 次；
+            #  · 但对任何类型都拦一下「错误页」——OSS 出错会返回 XML / HTML，文件头能认出来。
             with open(path, "rb") as f:
-                if f.read(5) != b"%PDF-":
-                    os.remove(path)
-                    raise IOError("文件头不是 %PDF，疑似下载失败")
+                head = f.read(32)
+            low = head.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
+            if low.startswith((b"<?xml", b"<html", b"<!doctype", b"<error")):
+                os.remove(path)
+                raise IOError("服务端返回的是错误页而非文件（链接可能已过期）")
+            if path.lower().endswith(".pdf") and not head.startswith(b"%PDF-"):
+                os.remove(path)
+                raise IOError("PDF 文件头异常，疑似下载失败")
             return True
         except _Cancelled:
             # 取消：删半成品文件后向上抛
@@ -296,18 +304,79 @@ def download_file(url, path, ctx, cancel_check=None):
     raise RuntimeError("下载失败（已重试 %d 次）：%s" % (MAX_RETRY, last_err))
 
 
+# Windows 保留设备名：以此为文件名（或带扩展名的同名）无法创建，需加前缀规避
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} \
+    | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+
+
 def sanitize_filename(name):
-    name = name.strip()
+    name = str(name or "").strip()
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
     name = name.strip(". ").strip()
-    return name or "未命名文书"
+    if not name:
+        return "未命名文书"
+    # 路径长度保护：Windows 整条路径上限 260，过长的文书名要截断（重名由 (N) 机制兜底）
+    if len(name) > 100:
+        name = name[:100].strip(". ").strip() or "未命名文书"
+    if name.upper() in _RESERVED_NAMES or name.split(".")[0].upper() in _RESERVED_NAMES:
+        name = "_" + name
+    return name
 
 
 def safe_ext(wjgs, url):
+    """返回带点的扩展名。
+
+    c_wjgs 可能是 'pdf' / '.PDF' / 'application/pdf' 等形态，统一清洗成小写扩展名；
+    清洗不出合法扩展名时再从 URL 猜，最后兜底 .pdf。
+    旧实现直接拼 '.'+c_wjgs，遇到 'application/pdf' 会得到非法文件名。
+    """
+    ext = ""
     if wjgs:
-        return "." + wjgs.strip().lstrip(".")
-    m = re.search(r"\.([a-zA-Z0-9]{2,4})(?:\?|$)", url)
-    return "." + m.group(1) if m else ".pdf"
+        cand = re.sub(r"[^A-Za-z0-9]", "", str(wjgs).strip().lstrip("."))
+        if 1 <= len(cand) <= 5:
+            ext = "." + cand.lower()
+    if not ext:
+        m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", url or "")
+        ext = ("." + m.group(1).lower()) if m else ".pdf"
+    return ext
+
+
+def _find_existing_case_dir(base, prefix):
+    """在 base 下找「同一案件」已有的文件夹（名 == prefix 或 prefix_时间戳），取最近修改的。
+
+    用途：勾选「跳过已存在的同名文书」时复用旧文件夹，否则每次运行都新建带时间戳的
+    文件夹，文件永远不存在 → 跳过逻辑形同虚设。
+    """
+    best, best_mt = None, -1.0
+    try:
+        if prefix and os.path.isdir(base):
+            for name in os.listdir(base):
+                if name != prefix and not name.startswith(prefix + "_"):
+                    continue
+                full = os.path.join(base, name)
+                if not os.path.isdir(full):
+                    continue
+                mt = os.path.getmtime(full)
+                if mt > best_mt:
+                    best, best_mt = full, mt
+    except OSError:
+        pass
+    return best
+
+
+def _jpg_output_exists(pdf_path, case_dir, mode):
+    """该 PDF 对应的 JPG 是否已生成过（复用案件文件夹时用来决定要不要补转）。
+
+    命名规则见 convert_pdf_to_jpg：单页 stem.jpg，多页 stem_1.jpg、stem_2.jpg…
+    """
+    stem = sanitize_filename(os.path.splitext(os.path.basename(pdf_path))[0])
+    img_dir = (os.path.join(case_dir, "图片", stem) if mode == JPG_MODE_PERPDF
+               else os.path.join(case_dir, "图片"))
+    pat = re.compile(re.escape(stem) + r"(?:_\d+)?\.jpg$", re.IGNORECASE)
+    try:
+        return any(pat.match(n) for n in os.listdir(img_dir))
+    except OSError:
+        return False
 
 
 # ---------------- PDF -> JPG 转换（PyMuPDF / fitz） ----------------
@@ -412,10 +481,23 @@ def load_config():
     return cfg
 
 
-def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=True,
+def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=None,
                 skip_existing=True):
+    """保存配置。
+
+    auto_update 传 None = 「沿用配置文件里已有的值」，这是必须有别于 True 的语义：
+    该字段由更新模块（autoupdate._save_auto_update）在用户选「以后不再提醒」时写 false，
+    本函数若以默认 True 落盘，用户随后只要改动任意一个选项就会被悄悄重置回 true
+    ——「以后不再提醒」形同虚设。
+    """
     try:
         p = config_path()
+        if auto_update is None:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    auto_update = bool(json.load(f).get("auto_update", True))
+            except Exception:
+                auto_update = True
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump({
@@ -597,7 +679,12 @@ class App:
 
     # ---- 线程安全的日志（自动加 [HH:MM:SS] 时间戳）----
     def log_msg(self, msg):
-        self.root.after(0, self._log_msg, msg)
+        # 窗口可能已被销毁（用户关窗 / 更新重启），此时 after() 会抛 TclError；
+        # 下载线程仍在收尾，不能让它带着异常退出。
+        try:
+            self.root.after(0, self._log_msg, msg)
+        except Exception:
+            pass
 
     def _log_msg(self, msg):
         ts = datetime.now().strftime("[%H:%M:%S] ")
@@ -807,7 +894,8 @@ class App:
             "     - 模式二：按 PDF 文件名各自建子文件夹存放。\n"
             "     - 图片长边 2000 像素、高质量、短边自适应；多页自动加页码。\n"
             "   · 重复下载处理：默认勾选「跳过已存在的同名文书」，\n"
-            "     同一案件重复下载时不再重复拉取（需强制重下就取消勾选）。\n"
+            "     识别到案号时会复用上次的案件文件夹，已下过的文书直接跳过，\n"
+            "     省时省流量；需要整案重新下载就先取消勾选。\n"
             "4. 开始：点「⬇ 开始下载」，进度条实时显示「已下载 / 总份数 (百分比)」。\n"
             "   · 同一案件的多份文书会用 %d 个线程并发下载，速度更快。\n"
             "   · 下载过程中按钮变为「⏸ 取消下载」，点击可中途取消未完成任务。\n"
@@ -821,7 +909,9 @@ class App:
             "· 确认更新后显示下载进度与速度，可随时取消。\n"
             "· 下载完成后新版本直接放进本程序所在文件夹，自动重启，\n"
             "  并删掉旧版本文件；程序文件名保持不变，桌面快捷方式继续可用。\n"
-            "  请把程序放在有写入权限的位置（如桌面），放在只读目录里无法自动更新。\n\n"
+            "  请把程序放在有写入权限的位置（如桌面），放在只读目录里无法自动更新。\n"
+            "· 本程序有两种版本，功能完全一致：绿色单文件版（免安装，放哪都能跑）\n"
+            "  和安装版（会创建开始菜单/桌面快捷方式，可随时在系统「已安装的应用」里卸载）。\n\n"
             "————————— 常见问题 —————————\n"
             "Q：提示下载失败 / 链接无效？\n"
             "A：电子送达链接有时效，请重新从法院短信复制最新链接再试。\n\n"
@@ -986,14 +1076,22 @@ class App:
 
                 court = docs[0].get("c_fymc", "未知法院")
                 caseno = params["caseno"] or ""
-                # 任务启动时的时间戳：年月日时分秒（纯数字），避免同名法院不同链接合并到一个文件夹
-                ts = time.strftime("%Y%m%d%H%M%S")
-                folder = sanitize_filename(
-                    (court + ("_" + caseno if caseno else "") + "_" + ts).strip("_ ")
-                )
                 base = self.out_dir or default_out_dir()
                 os.makedirs(base, exist_ok=True)
-                case_dir = os.path.join(base, folder)
+                # 案件文件夹前缀 = 法院名[_案号]。只有识别到案号才有「同一案件」的判定依据，
+                # 所以仅在 caseno 非空时才允许复用旧文件夹 —— 否则同一法院的不同链接会被合并。
+                prefix = sanitize_filename((court + ("_" + caseno if caseno else "")).strip("_ "))
+                case_dir = None
+                if self.skip_existing and caseno:
+                    case_dir = _find_existing_case_dir(base, prefix)
+                if case_dir:
+                    self.log_msg("→ 复用已有案件文件夹（同案重下，跳过已下载的文书）")
+                else:
+                    # 新建文件夹带启动时间戳（年月日时分秒），避免同名法院不同链接合并
+                    folder = sanitize_filename(
+                        (court + ("_" + caseno if caseno else "") + "_"
+                         + time.strftime("%Y%m%d%H%M%S")).strip("_ "))
+                    case_dir = os.path.join(base, folder)
                 os.makedirs(case_dir, exist_ok=True)
                 with self._cancel_lock:
                     self.last_case_dir = case_dir
@@ -1023,10 +1121,19 @@ class App:
                     if self.stop_event.is_set():
                         return (i_, raw_, "cancelled", None, full_)
                     # 已存在同名文件跳过：重复下载同一案件时省时省流量
-                    # （需要重下时删掉旧文件再跑即可）
+                    # （复用了旧案件文件夹才可能命中；需要重下时取消勾选即可）
                     if self.skip_existing and os.path.exists(full_) and os.path.getsize(full_) > 0:
-                        return (i_, raw_, "skip",
-                                "    ⏭ 已存在，跳过：%s" % os.path.basename(full_), full_)
+                        msg = "    ⏭ 已存在，跳过：%s" % os.path.basename(full_)
+                        # 上次可能没勾转 JPG，本次勾了 → 补转一次，否则用户会以为转换丢了
+                        if (self.convert_jpg
+                                and os.path.basename(full_).lower().endswith(".pdf")):
+                            try:
+                                if not _jpg_output_exists(full_, case_dir, self.jpg_mode):
+                                    cnt = convert_pdf_to_jpg(full_, case_dir, self.jpg_mode)
+                                    msg += "  ✓ 补转 JPG：%d 页" % cnt
+                            except Exception as e2:  # noqa: BLE001
+                                msg += "  ✗ 转 JPG 失败：%s" % e2
+                        return (i_, raw_, "skip", msg, full_)
                     self.log_msg("[%d/%d] 下载：%s" % (i_, len(docs), raw_))
                     try:
                         download_file(

@@ -122,8 +122,25 @@ def _save_auto_update(config_file, enabled):
 
 
 # ---------------- 取 Release 信息 ----------------
+# 安装包（Setup / Installer / 安装版）绝不能当作自动更新的下载源：
+# 就地更新会把它搬进程序目录并改名成主程序名，等于用安装器覆盖程序本体。
+# 发布 Release 时会同时上传「绿色版 exe」和「安装版 exe」，必须显式区分。
+_INSTALLER_HINTS = ("setup", "installer", "install", "安装")
+
+
+def _looks_like_installer(name):
+    n = str(name or "").lower()
+    return any(h in n for h in _INSTALLER_HINTS)
+
+
 def fetch_latest_release(api_url, timeout=15):
-    """返回 dict(tag, notes, download_url)；无 exe 资产时 download_url 为 None。"""
+    """返回 dict(tag, notes, download_url)；无可用 exe 资产时 download_url 为 None。
+
+    download_url 只会指向「绿色单文件版」exe：名字含 setup/installer/安装 的资产一律跳过
+    （这类是安装包，交给用户手动下载安装，不能被自动更新消费）。
+    若 Release 里只有安装包，则返回 None，让界面提示「未找到可下载的更新文件」，
+    而不是把安装器当成新版程序下载下来。
+    """
     req = urllib.request.Request(
         api_url,
         headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
@@ -133,9 +150,13 @@ def fetch_latest_release(api_url, timeout=15):
         data = json.loads(resp.read().decode("utf-8"))
     dl = None
     for a in data.get("assets", []):
-        if str(a.get("name", "")).lower().endswith(".exe"):
-            dl = a.get("browser_download_url")
-            break
+        name = str(a.get("name", ""))
+        if not name.lower().endswith(".exe"):
+            continue
+        if _looks_like_installer(name):
+            continue
+        dl = a.get("browser_download_url")
+        break
     return {
         "tag": data.get("tag_name", ""),
         "notes": data.get("body", "") or "",
@@ -160,14 +181,14 @@ def _is_frozen():
 
 
 def _base_stem(stem):
-    """去掉 _旧版[_时间戳] / _更新中[_序号] 后缀，还原出本程序的基准文件名。"""
-    return re.sub(r"_(?:旧版(?:_\d{14})?|更新中(?:_\d+)?)$", "", stem)
+    """去掉 _旧版[_数字] / _更新中[_数字] 后缀，还原出本程序的基准文件名。"""
+    return re.sub(r"_(?:旧版(?:_\d+)?|更新中(?:_\d+)?)$", "", stem)
 
 
 def _old_version_pattern(base_stem, ext):
     """只匹配本程序自己产生的旧版/中间文件，避免误删同目录其他文件。"""
     return re.compile(
-        r"^%s_(?:旧版(?:_\d{14})?|更新中(?:_\d+)?)%s$" % (re.escape(base_stem), re.escape(ext)),
+        r"^%s_(?:旧版(?:_\d+)?|更新中(?:_\d+)?)%s$" % (re.escape(base_stem), re.escape(ext)),
         re.IGNORECASE,
     )
 
@@ -258,7 +279,17 @@ def settle_after_update(log_fn=None):
 
     # ① 接管文件名：自己叫中间名时，把旧版挪开（运行中的 exe 允许改名），自己顶上
     if os.path.abspath(current).lower() != os.path.abspath(final).lower():
-        parked = os.path.join(directory, "%s_旧版%s" % (base, ext))
+        # 旧版名带时间戳：若沿用固定名（xxx_旧版.exe），一旦上次更新留下同名残留，
+        # Windows 的 os.rename 会因「目标已存在」直接失败 → 接管失败 → 用户继续启动
+        # 旧版本（症状就是「更新了却没变」）。带时间戳 + 冲突兜底可彻底避免。
+        parked = os.path.join(
+            directory, "%s_旧版_%s%s" % (base, time.strftime("%Y%m%d%H%M%S"), ext))
+        if os.path.exists(parked):
+            try:
+                os.remove(parked)          # 自己上次的残留，能删就复用这个名字
+            except OSError:
+                parked = os.path.join(
+                    directory, "%s_旧版_%d%s" % (base, int(time.time() * 1000), ext))
         try:
             if os.path.exists(final):
                 os.rename(final, parked)

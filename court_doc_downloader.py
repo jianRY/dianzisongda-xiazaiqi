@@ -133,14 +133,19 @@ def download_file(url, path, ctx):
                         if not buf:
                             break
                         f.write(buf)
-            # 校验：必须是真实文件且以 %PDF 开头（OSS 出错会返回 XML）
+            # 校验：0 字节 / 拿到的是错误页（OSS 出错会返回 XML/HTML）
             if os.path.getsize(path) == 0:
                 raise IOError("下载到 0 字节")
             with open(path, "rb") as f:
-                head = f.read(5)
-            if head != b"%PDF-":
+                head = f.read(32)
+            low = head.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
+            if low.startswith((b"<?xml", b"<html", b"<!doctype", b"<error")):
                 os.remove(path)
-                raise IOError("文件头不是 %PDF，疑似下载失败（拿到的是错误页）")
+                raise IOError("服务端返回的是错误页而非文件（链接可能已过期）")
+            # 文书不一定是 PDF，只在 .pdf 上强制魔数校验
+            if path.lower().endswith(".pdf") and not head.startswith(b"%PDF-"):
+                os.remove(path)
+                raise IOError("PDF 文件头异常，疑似下载失败")
             return True
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -156,24 +161,37 @@ def download_file(url, path, ctx):
 
 
 # ---------- 工具：文件名清洗 ----------
+# Windows 保留设备名：以此为文件名（或带扩展名的同名）无法创建，需加前缀规避
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} \
+    | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+
+
 def sanitize_filename(name):
-    name = name.strip()
+    name = str(name or "").strip()
     # 去掉 Windows / 各类文件系统不允许的字符
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
     # 去掉首尾空格与句点
     name = name.strip(". ").strip()
     if not name:
-        name = "未命名文书"
+        return "未命名文书"
+    # 路径长度保护：Windows 整条路径上限 260，过长的文书名要截断（重名由 (N) 机制兜底）
+    if len(name) > 100:
+        name = name[:100].strip(". ").strip() or "未命名文书"
+    if name.upper() in _RESERVED_NAMES or name.split(".")[0].upper() in _RESERVED_NAMES:
+        name = "_" + name
     return name
 
 
 def safe_ext(wjgs, url):
+    """返回带点的扩展名；c_wjgs 可能是 'pdf' / '.PDF' / 'application/pdf'，需清洗。"""
     ext = ""
     if wjgs:
-        ext = "." + wjgs.strip().lstrip(".")
+        cand = re.sub(r"[^A-Za-z0-9]", "", str(wjgs).strip().lstrip("."))
+        if 1 <= len(cand) <= 5:
+            ext = "." + cand.lower()
     if not ext:
-        m = re.search(r"\.([a-zA-Z0-9]{2,4})(?:\?|$)", url)
-        ext = "." + m.group(1) if m else ".pdf"
+        m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", url or "")
+        ext = ("." + m.group(1).lower()) if m else ".pdf"
     return ext
 
 
