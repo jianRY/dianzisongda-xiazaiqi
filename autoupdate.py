@@ -7,10 +7,10 @@ autoupdate.py — Tkinter 应用通用自动更新模块（零第三方依赖，
 功能（2026-09-13 改为「就地更新」，供所有带更新功能的软件复用）：
     1. 启动后台检查 GitHub Latest Release（静默，失败不打扰）
     2. 发现新版本 → 弹窗显示「更新内容」（取 Release body，自动清理 markdown 符号）
-       三个选择：
-         ✅ 立即更新   → 下载进度对话框（进度条 / 速度 / 已下载大小 / 随时取消）
-         ⏭ 本次忽略   → 本次关闭，下次启动继续检查
-         🚫 以后不再提醒 → 配置文件写 auto_update=false，启动不再自动检查
+       三个选择（统一扁平按钮：主按钮蓝底白字，次按钮灰底深字）：
+         立即更新     → 下载进度对话框（进度条 / 速度 / 已下载大小 / 随时取消）
+         本次忽略     → 本次关闭，下次启动继续检查
+         以后不再提醒 → 配置文件写 auto_update=false，启动不再自动检查
     3. 下载完成 → 新版直接放进程序所在目录并接管原文件名，旧版由新版启动后删除
        （不生成 bat、不做「等进程退出」的轮询，见 windows_replace_and_restart）
     4. 菜单/按钮手动「检查更新」不受 auto_update 开关影响（manual=True）
@@ -483,17 +483,23 @@ class UpdateDialog(tk.Toplevel):
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(4, 0))
-        style = ttk.Style()
-        try:
-            style.configure("Primary.TButton", font=("Microsoft YaHei", 10, "bold"), padding=6)
-        except Exception:
-            pass
-        ttk.Button(btns, text="✅ 立即更新", style="Primary.TButton",
-                   command=self._on_update).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="⏭ 本次忽略",
-                   command=self._on_skip).pack(side="right", padx=(8, 0))
-        ttk.Button(btns, text="🚫 以后不再提醒",
-                   command=self._on_never).pack(side="right")
+        # 统一按钮样式：主按钮蓝色实底 + 白字加粗，次按钮浅灰 + 深字常规，
+        # 三者字号 / 内边距 / 圆角观感一致（tk.Button 扁平化，ttk 在 vista 主题下改不了底色）
+        def _mkbtn(parent, text, cmd, primary=False):
+            return tk.Button(
+                parent, text=text, command=cmd,
+                font=("Microsoft YaHei", 10, "bold") if primary else ("Microsoft YaHei", 10),
+                bg="#2563eb" if primary else "#e5e7eb",
+                fg="#ffffff" if primary else "#1f2937",
+                activebackground="#1d4ed8" if primary else "#d1d5db",
+                activeforeground="#ffffff" if primary else "#1f2937",
+                relief="flat", bd=0, cursor="hand2",
+                padx=18 if primary else 14, pady=6,
+            )
+
+        _mkbtn(btns, "以后不再提醒", self._on_never).pack(side="left")
+        _mkbtn(btns, "本次忽略", self._on_skip).pack(side="left", padx=(8, 0))
+        _mkbtn(btns, "立即更新", self._on_update, primary=True).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._on_skip)
         self.update_idletasks()
@@ -578,7 +584,12 @@ class DownloadProgressDialog(tk.Toplevel):
         self.lbl_speed = ttk.Label(frm, text="速度：—", font=("Microsoft YaHei", 10), foreground="#555")
         self.lbl_speed.pack(anchor="w", pady=(2, 10))
 
-        ttk.Button(frm, text="✖ 取消更新", command=self._on_cancel).pack(anchor="e")
+        tk.Button(frm, text="取消更新", command=self._on_cancel,
+                  font=("Microsoft YaHei", 10),
+                  bg="#e5e7eb", fg="#1f2937",
+                  activebackground="#d1d5db", activeforeground="#1f2937",
+                  relief="flat", bd=0, cursor="hand2", padx=14, pady=5,
+                  ).pack(anchor="e")
 
         self.update_idletasks()
         w = 460
