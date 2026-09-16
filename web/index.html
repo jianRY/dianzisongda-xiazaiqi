@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>法院文书下载器 · 电子送达文书一键下载</title>
+<meta name="description" content="法院文书下载器 —— 从全国法院统一送达平台自动下载电子送达文书，绿色版 / 安装版双版本，自动更新。">
+<style>
+  :root{
+    --navy:#0e2a4d; --navy2:#123a63; --navy3:#0a1f3a;
+    --gold:#d9a441; --gold2:#e8bd6a;
+    --ink:#1f2937; --muted:#64748b;
+    --bg:#f5f7fa; --card:#ffffff; --line:#e5eaf0;
+    --blue:#2563eb; --blue2:#1d4ed8;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--ink);line-height:1.7}
+  a{color:var(--blue);text-decoration:none}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+
+  /* ---------- header ---------- */
+  header{background:linear-gradient(160deg,var(--navy) 0%,var(--navy2) 55%,var(--navy3) 100%);color:#fff;padding:0 0 70px}
+  nav{display:flex;align-items:center;justify-content:space-between;padding:18px 0}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:.5px}
+  .brand svg{width:30px;height:30px}
+  nav .gh{color:#cbd5e1;font-size:14px;display:flex;align-items:center;gap:6px}
+  nav .gh:hover{color:#fff}
+  .hero{text-align:center;padding:46px 0 0}
+  .hero h1{font-size:40px;letter-spacing:2px;font-weight:800}
+  .hero h1 .gold{color:var(--gold2)}
+  .hero p.sub{color:#b8c7db;font-size:17px;margin-top:14px}
+  .verline{margin-top:26px;display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap}
+  .badge{display:inline-flex;align-items:center;gap:8px;background:rgba(217,164,65,.14);border:1px solid rgba(217,164,65,.5);color:var(--gold2);font-size:14px;padding:5px 14px;border-radius:999px}
+  .badge b{font-weight:700}
+  .badge.gray{background:rgba(148,163,184,.15);border-color:rgba(148,163,84,.4);color:#cbd5e1}
+  .dl{display:flex;justify-content:center;gap:16px;margin-top:30px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:10px;padding:13px 30px;border-radius:10px;font-size:16px;font-weight:700;transition:.2s;border:1px solid transparent}
+  .btn svg{width:20px;height:20px}
+  .btn.primary{background:var(--gold);color:#1a1206}
+  .btn.primary:hover{background:var(--gold2);transform:translateY(-2px)}
+  .btn.ghost{background:rgba(255,255,255,.08);color:#fff;border-color:rgba(255,255,255,.35)}
+  .btn.ghost:hover{background:rgba(255,255,255,.16)}
+  .dl-meta{margin-top:14px;color:#8fa3bd;font-size:13px}
+
+  /* ---------- sections ---------- */
+  section{padding:56px 0 8px}
+  h2{font-size:24px;text-align:center;letter-spacing:1px}
+  h2::after{content:"";display:block;width:44px;height:3px;background:var(--gold);margin:12px auto 0;border-radius:2px}
+  .sec-sub{text-align:center;color:var(--muted);margin-top:10px;font-size:15px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin-top:34px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px 22px;box-shadow:0 2px 10px rgba(15,42,77,.05);transition:.2s}
+  .card:hover{transform:translateY(-3px);box-shadow:0 8px 22px rgba(15,42,77,.10)}
+  .card .ic{width:44px;height:44px;border-radius:10px;background:linear-gradient(150deg,var(--navy),var(--navy2));display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+  .card .ic svg{width:24px;height:24px}
+  .card h3{font-size:16.5px;margin-bottom:8px}
+  .card p{font-size:14px;color:var(--muted)}
+
+  /* changelog */
+  .log-box{margin-top:34px;display:flex;flex-direction:column;gap:14px}
+  .log-item{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 24px}
+  .log-item .lt{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .log-item .v{font-weight:800;font-size:16px;color:var(--navy2)}
+  .log-item .d{font-size:13px;color:var(--muted)}
+  .log-item .tag{font-size:12px;padding:2px 10px;border-radius:999px;background:#eef2ff;color:#4338ca}
+  .log-item ul{margin:10px 0 0 20px;color:#374151;font-size:14px}
+  .log-item li{margin:3px 0}
+  .log-loading{text-align:center;color:var(--muted);padding:30px 0}
+  .log-fallback{background:#fffbeb;border:1px solid #fde68a;border-radius:14px;padding:20px 24px;font-size:14px;color:#92400e}
+
+  /* steps */
+  .steps{counter-reset:st;margin-top:34px;display:grid;gap:14px}
+  .step{display:flex;gap:16px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 20px}
+  .step::before{counter-increment:st;content:counter(st);flex:0 0 32px;height:32px;border-radius:50%;background:var(--navy2);color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:15px}
+  .step p{font-size:14.5px;color:#374151;padding-top:3px}
+  .step code{background:#eef2f7;border:1px solid var(--line);border-radius:6px;padding:1px 7px;font-size:13px}
+
+  footer{margin-top:60px;background:var(--navy3);color:#8fa3bd;padding:30px 0;text-align:center;font-size:13px}
+  footer a{color:#b8c7db}
+  footer .disc{margin-top:8px;color:#64748b}
+  @media(max-width:640px){.hero h1{font-size:28px}.hero p.sub{font-size:15px}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <nav>
+      <div class="brand">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 2v20M4 7h16M6 7l-3.5 7a4 4 0 0 0 7 0L6 7zm12 0l-3.5 7a4 4 0 0 0 7 0L18 7z" stroke="#d9a441" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        法院文书下载器
+      </div>
+      <a class="gh" href="https://github.com/jianRY/dianzisongda-xiazaiqi" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub 仓库
+      </a>
+    </nav>
+    <div class="hero">
+      <h1>法院<span class="gold">文书下载器</span></h1>
+      <p class="sub">全国法院统一送达平台 · 电子送达文书一键下载<br>粘贴送达短信或链接，自动下载该案件全部文书</p>
+      <div class="verline">
+        <span class="badge" id="verBadge">版本加载中…</span>
+        <span class="badge gray" id="dateBadge"></span>
+      </div>
+      <div class="dl">
+        <a class="btn primary" id="dlGreen" href="https://github.com/jianRY/dianzisongda-xiazaiqi/releases/latest" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0l-4.5-4.5M12 15l4.5-4.5M4 19h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          绿色版下载
+        </a>
+        <a class="btn ghost" id="dlSetup" href="https://github.com/jianRY/dianzisongda-xiazaiqi/releases/latest" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 4.5-3.2 7.7-8 9-4.8-1.3-8-4.5-8-9V7l8-4z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          安装版下载
+        </a>
+      </div>
+      <p class="dl-meta" id="dlMeta">Windows 10/11 · 双版本均含数字签名 · 历史版本见 GitHub Releases</p>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section>
+    <h2>核心功能</h2>
+    <p class="sec-sub">为诉讼当事人打造的送达文书获取工具，零学习成本</p>
+    <div class="grid">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h9" stroke="#e8bd6a" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <h3>粘贴即下</h3>
+        <p>把送达短信里的链接（或整段短信）粘进输入框，自动提取案件全部文书，无需登录平台。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h10M4 12h16M4 17h7M18 5v6m0 0l-2.5-2.5M18 11l2.5-2.5" stroke="#e8bd6a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>批量多链接</h3>
+        <p>支持一次粘贴多个案件链接，按案件自动归档文件夹，法院名 + 案号清晰命名。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M13 3L5 13h5l-1 8 8-10h-5l1-8z" stroke="#e8bd6a" stroke-width="2" stroke-linejoin="round"/></svg></div>
+        <h3>多线程并发</h3>
+        <p>案件内 4 线程并发下载，实时显示进度百分比，支持随时取消。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3h7l5 5v13H7V3zm7 0v5h5" stroke="#e8bd6a" stroke-width="2" stroke-linejoin="round"/><path d="M10 13h6M10 17h6" stroke="#e8bd6a" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <h3>自动转 JPG</h3>
+        <p>PDF 文书一键转高清长图（多页自动拼接编号），微信传材料、打印都方便。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" stroke="#e8bd6a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>自动更新</h3>
+        <p>启动自动检查新版本，弹窗展示更新内容，一键升级、随时取消，无需手动重装。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 4.5-3.2 7.7-8 9-4.8-1.3-8-4.5-8-9V7l8-4z" stroke="#e8bd6a" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="#e8bd6a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>绿色 + 安装版</h3>
+        <p>单文件绿色版解压即用；安装版带向导、可选目录、开始菜单与桌面快捷方式，可正常卸载。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>更新日志</h2>
+    <p class="sec-sub">与 GitHub Release 实时同步，自动展示最近版本</p>
+    <div class="log-box" id="logBox">
+      <div class="log-loading">正在获取最新版本信息…</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>使用步骤</h2>
+    <div class="steps">
+      <div class="step"><p>下载并运行（绿色版双击即用；安装版按向导选择目录安装）。</p></div>
+      <div class="step"><p>把法院送达短信里的链接或整段短信粘贴到输入框，可一次粘贴多个链接。</p></div>
+      <div class="step"><p>点「开始下载」，等待进度完成；如需图片格式，勾选「转换为 JPG」。</p></div>
+      <div class="step"><p>点「打开保存文件夹」查看文书，默认保存在 <code>桌面\文书</code>（可自定义）。</p></div>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div>项目仓库：<a href="https://github.com/jianRY/dianzisongda-xiazaiqi" target="_blank" rel="noopener">github.com/jianRY/dianzisongda-xiazaiqi</a></div>
+    <div class="disc">本工具仅供本人依法处理诉讼事务使用，数据来源：全国法院统一送达平台（zxfw.court.gov.cn）</div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var REPO = 'jianRY/dianzisongda-xiazaiqi';
+  var API = 'https://api.github.com/repos/' + REPO + '/releases?per_page=5';
+  var box = document.getElementById('logBox');
+
+  function fmtDate(s){
+    try{ var d = new Date(s); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+    catch(e){ return ''; }
+  }
+  function esc(t){ var d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+  function bodyToList(body){
+    if(!body) return '';
+    var lines = body.split(/\r?\n/), out = [];
+    for(var i=0;i<lines.length;i++){
+      var l = lines[i].replace(/^#+\s*/,'').trim();
+      if(!l) continue;
+      if(/^[-*]\s+/.test(l)) out.push('<li>' + esc(l.replace(/^[-*]\s+/,'')) + '</li>');
+      else if(out.length) break; /* 只取首段要点 */
+    }
+    return out.length ? '<ul>' + out.join('') + '</ul>' : '<ul><li>' + esc(body.slice(0,120)) + '</li></ul>';
+  }
+  function fmtMB(n){ return (n/1024/1024).toFixed(1) + ' MB'; }
+
+  fetch(API, {cache:'no-store'})
+    .then(function(r){ if(!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(list){
+      if(!list || !list.length) throw new Error('empty');
+      var latest = list[0];
+      /* 版本徽章 */
+      var vb = document.getElementById('verBadge');
+      vb.innerHTML = '最新版本 <b>' + esc(latest.tag_name.replace(/^v/,'v')) + '</b>';
+      var db = document.getElementById('dateBadge');
+      db.textContent = '发布于 ' + (fmtDate(latest.published_at) || '—');
+      /* 下载按钮指向对应资产 */
+      var assets = latest.assets || [], green = null, setup = null, total = 0;
+      for(var i=0;i<assets.length;i++){
+        var a = assets[i]; total++;
+        if(/setup|installer/i.test(a.name)) setup = a;
+        else if(/\.exe$/i.test(a.name)) green = a;
+      }
+      if(green){
+        document.getElementById('dlGreen').href = green.browser_download_url;
+        document.getElementById('dlMeta').textContent = 'Windows 10/11 · 绿色版 ' + fmtMB(green.size) +
+          (setup ? ' / 安装版 ' + fmtMB(setup.size) : '') + ' · 均含数字签名 · 历史版本见 GitHub Releases';
+      }
+      if(setup) document.getElementById('dlSetup').href = setup.browser_download_url;
+      /* 更新日志 */
+      var html = '';
+      for(var k=0;k<list.length;k++){
+        var rel = list[k];
+        html += '<div class="log-item"><div class="lt"><span class="v">' + esc(rel.tag_name) + '</span>' +
+          (k === 0 ? '<span class="tag">最新</span>' : '') +
+          '<span class="d">' + (fmtDate(rel.published_at) || '') + '</span>' +
+          '<span class="d"><a href="' + esc(rel.html_url) + '" target="_blank" rel="noopener">查看 Release</a></span></div>' +
+          bodyToList(rel.body) + '</div>';
+      }
+      box.innerHTML = html;
+    })
+    .catch(function(){
+      box.innerHTML = '<div class="log-fallback">暂时无法获取在线版本信息（网络原因）。' +
+        '请直接前往 <a href="https://github.com/jianRY/dianzisongda-xiazaiqi/releases" target="_blank" rel="noopener">GitHub Releases 页面</a> 查看最新版本与下载。</div>';
+      var vb = document.getElementById('verBadge');
+      vb.className = 'badge gray';
+      vb.textContent = '最新版本请见下载按钮';
+      document.getElementById('dateBadge').style.display = 'none';
+    });
+})();
+</script>
+</body>
+</html>
