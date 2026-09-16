@@ -54,7 +54,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.9"
+VERSION = "2.0"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -643,10 +643,9 @@ class App:
         )
         self.log.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        # 底部按钮
+        # 底部按钮（检查更新入口已移至菜单栏「更新 → 检查更新」，不再放窗口左下角）
         frm2 = ttk.Frame(root)
         frm2.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Button(frm2, text="检查更新", command=self.check_update_manual).pack(side="left")
         ttk.Button(frm2, text="打开保存文件夹", command=self.open_folder).pack(side="right")
         ttk.Button(frm2, text="清空日志", command=self.clear_log).pack(side="right", padx=6)
 
@@ -906,7 +905,7 @@ class App:
             "     防止同名法院不同链接的文件被合并。\n\n"
             "————————— 自动更新 —————————\n"
             "· 程序启动时会自动检查更新，发现新版会弹窗显示本次更新内容。\n"
-            "· 弹窗三选：✅ 立即更新 / ⏭ 本次忽略 / 🚫 以后不再提醒。\n"
+            "· 弹窗三选：立即更新 / 本次忽略 / 以后不再提醒。\n"
             "  选「以后不再提醒」后启动不再自动检查（菜单里仍可手动检查）。\n"
             "· 确认更新后显示下载进度与速度，可随时取消。\n"
             "· 下载完成后新版本直接放进本程序所在文件夹，自动重启，\n"
