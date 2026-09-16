@@ -54,7 +54,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "1.8"
+VERSION = "1.9"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -877,6 +877,8 @@ class App:
         txt = scrolledtext.ScrolledText(win, wrap="word", font=("Microsoft YaHei", 10))
         txt.pack(fill="both", expand=True, padx=10, pady=10)
         content = (
+            "★ 项目仓库：https://github.com/jianRY/dianzisongda-xiazaiqi\n"
+            "   （新版发布、历史版本下载都在这里，欢迎 Star）\n\n"
             "【法院文书下载器 · 使用说明 v%s】\n\n"
             "本工具用于从「全国法院统一送达平台」发来的电子送达短信/链接中，\n"
             "自动下载对应的裁判文书（PDF）到本地文件夹。\n\n"
@@ -933,6 +935,7 @@ class App:
             "法院文书下载器  v%s\n\n"
             "从全国法院统一送达平台自动下载电子送达文书。\n"
             "数据来源：zxfw.court.gov.cn\n\n"
+            "项目仓库：https://github.com/jianRY/dianzisongda-xiazaiqi\n\n"
             "仅供本人依法处理诉讼事务使用。" % VERSION,
         )
 
