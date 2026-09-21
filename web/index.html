@@ -112,7 +112,7 @@
           安装版下载
         </a>
       </div>
-      <p class="dl-meta" id="dlMeta">Windows 10/11 · 双版本均含数字签名 · 历史版本见 GitHub Releases</p>
+      <p class="dl-meta" id="dlMeta">Windows 10/11 · 双版本均含数字签名 · 国内直连下载 47.116.64.26:8888</p>
     </div>
   </div>
 </header>
@@ -187,6 +187,10 @@
 (function(){
   var REPO = 'jianRY/dianzisongda-xiazaiqi';
   var API = 'https://api.github.com/repos/' + REPO + '/releases?per_page=5';
+  /* 自有下载站的更新元数据（国内直连，快）。服务器脚本从 Release 抄过来，
+     含版本号 / 更新说明 / 服务器直链 / GitHub 兜底直链。取到就优先用它。 */
+  var SERVER_META = 'http://47.116.64.26:8888/updates/court.json';
+  var serverOK = false;
   var box = document.getElementById('logBox');
 
   function fmtDate(s){
@@ -207,6 +211,24 @@
   }
   function fmtMB(n){ return (n/1024/1024).toFixed(1) + ' MB'; }
 
+  /* ① 先取自有服务器上的元数据（国内直连，秒回）：点亮版本徽章、把两个下载按钮
+     指向服务器直链。失败就什么都不做，交给下面的 GitHub API 兜底。 */
+  fetch(SERVER_META, {cache:'no-store'})
+    .then(function(r){ if(!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(m){
+      if(!m || !m.version) throw new Error('empty');
+      serverOK = true;
+      document.getElementById('verBadge').innerHTML =
+        '最新版本 <b>v' + esc(String(m.version).replace(/^v/,'')) + '</b>';
+      var g = document.getElementById('dlGreen'), s = document.getElementById('dlSetup');
+      if(m.url) g.href = m.url;
+      if(m.setup_url) s.href = m.setup_url;
+      document.getElementById('dlMeta').textContent =
+        'Windows 10/11 · 国内直连下载（不经 GitHub）' +
+        (m.size ? ' · 绿色版 ' + fmtMB(m.size) : '') + ' · 均含数字签名';
+    })
+    .catch(function(){ /* 服务器不可用 → GitHub API 兜底 */ });
+
   fetch(API, {cache:'no-store'})
     .then(function(r){ if(!r.ok) throw new Error('http ' + r.status); return r.json(); })
     .then(function(list){
@@ -225,11 +247,14 @@
         else if(/\.exe$/i.test(a.name)) green = a;
       }
       if(green){
-        document.getElementById('dlGreen').href = green.browser_download_url;
-        document.getElementById('dlMeta').textContent = 'Windows 10/11 · 绿色版 ' + fmtMB(green.size) +
-          (setup ? ' / 安装版 ' + fmtMB(setup.size) : '') + ' · 均含数字签名 · 历史版本见 GitHub Releases';
+        /* 服务器元数据已点亮按钮时不要覆盖：那只走 GitHub，国内会更慢 */
+        if(!serverOK){
+          document.getElementById('dlGreen').href = green.browser_download_url;
+          document.getElementById('dlMeta').textContent = 'Windows 10/11 · 绿色版 ' + fmtMB(green.size) +
+            (setup ? ' / 安装版 ' + fmtMB(setup.size) : '') + ' · 均含数字签名 · 历史版本见 GitHub Releases';
+        }
       }
-      if(setup) document.getElementById('dlSetup').href = setup.browser_download_url;
+      if(setup && !serverOK) document.getElementById('dlSetup').href = setup.browser_download_url;
       /* 更新日志 */
       var html = '';
       for(var k=0;k<list.length;k++){

@@ -38,6 +38,7 @@ Release 要求：
     - assets 里放一个 .exe（自动取第一个 .exe 作为下载地址）。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,32 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+# ---------------- 自有下载站（2026-09-22 新增） ----------------
+# 起因：用户反馈从 GitHub 下载又慢又容易超时。本机搭了国内下载站
+# （阿里云 47.116.64.26:8888），更新元数据与 exe 都同步过去，
+# 检查更新与下载都优先走它，GitHub 只作兜底。
+SITE_URL = "http://47.116.64.26:8888"
+
+# GitHub 仓库 → 服务器上的 update.json 文件名（与下载服务器 REPOS 配置一致）
+_REPO_TO_APP = {
+    "jianry/dianzisongda-xiazaiqi": "court",
+    "jianry/invoice-ocr-tool": "ocr",
+    "jianry/invoice-qr-tool": "qr",
+}
+
+
+def _server_meta_url(api_url):
+    """从 GitHub API 地址推出自有服务器上的 update.json 地址；认不出则返回 None。
+
+    https://api.github.com/repos/<owner>/<repo>/releases/latest
+        → http://47.116.64.26:8888/updates/<app>.json
+    """
+    m = re.search(r"repos/([^/]+/[^/]+)/releases", str(api_url or ""))
+    if not m:
+        return None
+    key = _REPO_TO_APP.get(m.group(1).lower())
+    return "%s/updates/%s.json" % (SITE_URL, key) if key else None
 
 
 # ---------------- 版本比较 ----------------
@@ -161,8 +188,65 @@ def fetch_latest_release(api_url, timeout=15):
         "tag": data.get("tag_name", ""),
         "notes": data.get("body", "") or "",
         "download_url": dl,
+        "download_urls": [dl] if dl else [],
+        "sha256": "",
         "html_url": data.get("html_url", ""),
+        "source": "GitHub API",
     }
+
+
+def _http_json(url, timeout=8):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": UA, "Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _file_sha256(path):
+    """算文件 SHA256，用于校验下载到的更新包完整（update.json 里带 sha256）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_update_info(latest_api_url, timeout=8, log_fn=None):
+    """依次尝试「自有服务器 → GitHub API」，返回统一的更新信息 dict 或 None。
+
+    自有服务器上的 update.json 由各仓库的发版脚本生成、随 Release 上传、
+    再由服务器定时脚本抄到 /updates/<app>.json。它同时给出
+        url          自有服务器直链（首选，国内快）
+        fallback_url GitHub Release 直链（服务器没同步到 / 不可达时兜底）
+    两级都失败返回 None —— 静默失败，绝不因为检查更新把软件卡住。
+    """
+    def _log(m):
+        try:
+            if log_fn:
+                log_fn(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+    meta_url = _server_meta_url(latest_api_url)
+    if meta_url:
+        try:
+            d = _http_json(meta_url, timeout)
+            if isinstance(d, dict) and d.get("version") and d.get("url"):
+                urls = [u for u in (d.get("url"), d.get("fallback_url")) if u]
+                _log("已从自有服务器获取版本信息：v%s" % d["version"])
+                return {
+                    "tag": str(d["version"]).strip(),
+                    "notes": d.get("notes") or "",
+                    "download_url": urls[0],
+                    "download_urls": urls,
+                    "sha256": (d.get("sha256") or "").strip().lower(),
+                    "html_url": d.get("release_url", ""),
+                    "source": "自有服务器",
+                }
+        except Exception:  # noqa: BLE001
+            pass
+
+    return fetch_latest_release(latest_api_url, timeout=timeout)
 
 
 # ---------------- 就地更新（Windows，不借助外部脚本） ----------------
@@ -403,7 +487,7 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
 
     def _worker():
         try:
-            info = fetch_latest_release(latest_api_url)
+            info = fetch_update_info(latest_api_url, log_fn=log_fn)
         except urllib.error.HTTPError as e:
             if manual:
                 if e.code in (401, 403, 404):
@@ -424,7 +508,8 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
                 parent.after(0, lambda: messagebox.showinfo(
                     "检查更新", "已是最新版本 v%s。" % current_version))
             return
-        if not info.get("download_url"):
+        urls = info.get("download_urls") or ([info["download_url"]] if info.get("download_url") else [])
+        if not urls:
             if manual:
                 parent.after(0, lambda: messagebox.showinfo(
                     "检查更新", "发现新版本 %s，但未找到可下载的更新文件。" % tag))
@@ -434,7 +519,8 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
         parent.after(0, lambda: UpdateDialog(
             parent, app_name=app_name, current_version=current_version,
             tag=tag, notes=info.get("notes", ""),
-            download_url=info["download_url"],
+            download_urls=urls, sha256=info.get("sha256", ""),
+            html_url=info.get("html_url", ""),
             config_file=config_file, install_helper=install_helper, log_fn=log_fn,
             on_before_install=on_before_install,
         ))
@@ -445,8 +531,9 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
 # ---------------- 更新确认弹窗（三选项） ----------------
 class UpdateDialog(tk.Toplevel):
     def __init__(self, master, app_name, current_version, tag, notes,
-                 download_url, config_file, install_helper, log_fn=None,
-                 on_before_install=None):
+                 download_url=None, config_file=None, install_helper=None,
+                 log_fn=None, on_before_install=None,
+                 download_urls=None, sha256="", html_url=""):
         super().__init__(master)
         self.title("发现新版本 · %s" % app_name)
         self.configure(bg="#f4f6f8")
@@ -456,7 +543,10 @@ class UpdateDialog(tk.Toplevel):
             self.grab_set()  # 模态
         except Exception:
             pass
-        self._download_url = download_url
+        self._download_urls = download_urls or ([download_url] if download_url else [])
+        self._sha256 = sha256
+        self._html_url = html_url
+        self._download_url = self._download_urls[0] if self._download_urls else None
         self._app_name = app_name
         self._config_file = config_file
         self._install_helper = install_helper
@@ -519,6 +609,7 @@ class UpdateDialog(tk.Toplevel):
         DownloadProgressDialog(
             self.master, app_name=self._app_name,
             download_url=self._download_url,
+            download_urls=self._download_urls, sha256=self._sha256,
             install_helper=self._install_helper, log_fn=self._log_fn,
             on_before_install=self._on_before_install,
         )
@@ -547,8 +638,9 @@ class DownloadProgressDialog(tk.Toplevel):
 
     POLL_MS = 150
 
-    def __init__(self, master, app_name, download_url, install_helper, log_fn=None,
-                 on_before_install=None):
+    def __init__(self, master, app_name, download_url=None, install_helper=None,
+                 log_fn=None, on_before_install=None,
+                 download_urls=None, sha256=""):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
         self.configure(bg="#f4f6f8")
@@ -558,7 +650,9 @@ class DownloadProgressDialog(tk.Toplevel):
             self.grab_set()
         except Exception:
             pass
-        self._url = download_url
+        self._urls = [u for u in (download_urls or ([download_url] if download_url else [])) if u]
+        self._url = self._urls[0] if self._urls else None
+        self._sha256 = (sha256 or "").strip().lower()
         self._app_name = app_name
         self._install_helper = install_helper
         self._log_fn = log_fn
@@ -603,42 +697,61 @@ class DownloadProgressDialog(tk.Toplevel):
     def _worker(self):
         st = self._state
         tmp = os.path.join(tempfile.gettempdir(), "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
-        try:
-            req = urllib.request.Request(
-                self._url, headers={"User-Agent": UA, "Accept": "*/*"}, method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                try:
-                    total = int(resp.headers.get("Content-Length", 0) or 0)
-                except (TypeError, ValueError):
-                    total = 0
-                st["total"] = total
-                done = 0
-                with open(tmp, "wb") as f:
-                    while True:
-                        if self._cancel_evt.is_set():
-                            raise IOError("cancelled")
-                        buf = resp.read(65536)
-                        if not buf:
-                            break
-                        f.write(buf)
-                        done += len(buf)
-                        st["done"] = done
+        last_err = None
+        # 多源依次尝试：自有服务器直链 → GitHub 直链（见 fetch_update_info）
+        for idx, url in enumerate(self._urls, 1):
             if self._cancel_evt.is_set():
-                raise IOError("cancelled")
-            if total and done != total:
-                raise IOError("下载不完整（%d / %d 字节）" % (done, total))
-            if os.path.getsize(tmp) < 100000:
-                raise IOError("下载文件过小，疑似失败")
-            st["result"] = tmp
-            st["running"] = False
-        except Exception as e:  # noqa: BLE001
-            st["error"] = e
-            st["running"] = False
+                break
             try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+                st["done"] = 0
+                st["total"] = 0
+                if idx > 1:
+                    st["note"] = "源 %d/%d" % (idx, len(self._urls))
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": UA, "Accept": "*/*"}, method="GET")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    try:
+                        total = int(resp.headers.get("Content-Length", 0) or 0)
+                    except (TypeError, ValueError):
+                        total = 0
+                    st["total"] = total
+                    done = 0
+                    with open(tmp, "wb") as f:
+                        while True:
+                            if self._cancel_evt.is_set():
+                                raise IOError("cancelled")
+                            buf = resp.read(65536)
+                            if not buf:
+                                break
+                            f.write(buf)
+                            done += len(buf)
+                            st["done"] = done
+                if self._cancel_evt.is_set():
+                    raise IOError("cancelled")
+                if total and done != total:
+                    raise IOError("下载不完整（%d / %d 字节）" % (done, total))
+                if os.path.getsize(tmp) < 100000:
+                    raise IOError("下载文件过小，疑似失败")
+                if self._sha256 and not _file_sha256(tmp) == self._sha256:
+                    raise IOError("文件校验失败（SHA256 不一致），已丢弃")
+                st["result"] = tmp
+                st["running"] = False
+                return
+            except Exception as e:  # noqa: BLE001
+                if self._cancel_evt.is_set():
+                    break
+                last_err = e
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                continue
+        if self._cancel_evt.is_set():
+            st["error"] = IOError("cancelled")
+        else:
+            st["error"] = last_err or IOError("所有下载源均不可用")
+        st["running"] = False
 
     # ---- UI 轮询 ----
     def _fmt(self, n):
