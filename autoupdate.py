@@ -86,6 +86,164 @@ def _server_meta_url(api_url):
     return "%s/updates/%s.json" % (SITE_URL, key) if key else None
 
 
+# ---------------- 公共 GitHub 加速镜像（2026-09-22 新增，同日调整为「主源」） ----------------
+# 起因：实测裸网直连 GitHub 只有 3.7 KB/s（基本等于不可用），必须走公共加速镜像；
+# 而镜像之间也差近 10 倍 —— 同一次实测：gh-proxy.com 439.6 KB/s、
+# ghfast.top 222.8 KB/s、ghproxy.net 45.6 KB/s。所以下载前先探测速度择优。
+#
+# 定位（2026-09-22 调整）：镜像 = **主源**；GitHub 原站与自有服务器直链退为兜底。
+#   注：自有服务器是阿里云 ECS 固定带宽，实测封顶 445 KB/s（4 并发合计仍 417 KB/s，
+#   说明是带宽上限，加线程无用），已不再比镜像快，故让出主源位置。
+#
+# ⚠️ 三条硬约束（改这里之前先读）：
+#   ① 镜像属第三方服务，随时可能失效 —— 本轮实测 9 个常见候选里 6 个已经死了
+#      （ghproxy.cc / hub.gitmirror.com / gh.llkk.cc / github.moeyy.xyz /
+#        ghproxy.cfd / hk.gh-proxy.com 全部拿不到连接）。
+#      所以列表**硬编码在客户端、靠发版换源**，不写进 update.json。
+#   ② 探测失败的源一律**不丢弃**，只排到最后继续尝试（探测失败 ≠ 不能下载）。
+#   ③ GitHub 原站与自有服务器直链永远保留在候选里兜底。
+MIRROR_PREFIXES = (
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+)
+
+PROBE_BYTES = 256 * 1024        # 探测读取的字节数（只用于"探活"，不用于精确排序：
+PROBE_TIMEOUT = 3               #   小样本会把 TCP 突发当速度；CDN 镜像还要 3~5 秒爬坡）
+MIN_USEFUL_SPEED = 100 * 1024   # 探测门限：低于此值视为"病源"，降级到队尾
+SWITCH_SPEED = 50 * 1024        # 下载中看门狗门限：连续 8 秒低于此值就换源续传
+
+
+def _is_mirror(url):
+    return any(str(url or "").startswith(p) for p in MIRROR_PREFIXES)
+
+
+def _src_rank(url):
+    """源的优先级别（仅在实测速度都达标时作并列排序的次要依据）：
+    0 = 加速镜像（CDN，天花板高）→ 1 = GitHub 直连 → 2 = 自有服务器（兜底）。"""
+    u = str(url or "")
+    if _is_mirror(u):
+        return 0
+    if "github.com/" in u:
+        return 1
+    return 2
+
+
+def _src_label(url):
+    """给人看的源名，用于进度框显示。"""
+    u = str(url or "")
+    for p in MIRROR_PREFIXES:
+        if u.startswith(p):
+            return "加速镜像 %s" % p.split("//")[1].strip("/")
+    if u.startswith(SITE_URL):
+        return "自有服务器"
+    if "github.com/" in u:
+        return "GitHub 原站"
+    try:
+        return u.split("//")[1].split("/")[0]
+    except IndexError:
+        return u[:30]
+
+
+def build_download_sources(urls):
+    """把候选下载地址展开成有序列表：加速镜像 → 自有服务器 → GitHub 直链兜底。
+
+    GitHub 直链会额外派生出镜像版本（同一文件，走 CDN），原链保留在最后：
+    国内实测直连 4 KB/s，只能当万不得已的兜底。
+    """
+    mirrors, others, gh = [], [], []
+    for u in (urls or []):
+        u = (u or "").strip()
+        if not u:
+            continue
+        if "github.com/" in u:
+            for p in MIRROR_PREFIXES:
+                m = p + u
+                if m not in mirrors:
+                    mirrors.append(m)
+            if u not in gh:
+                gh.append(u)
+        elif u not in others:
+            others.append(u)
+    return mirrors + gh + others
+
+
+def probe_speed(url, nbytes=PROBE_BYTES, timeout=PROBE_TIMEOUT):
+    """拉一小段（Range）探活测速，返回 KB/s；失败返回 0。不抛异常。"""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": UA, "Accept": "*/*", "Range": "bytes=0-%d" % (nbytes - 1)},
+        method="GET",
+    )
+    try:
+        t0 = time.monotonic()
+        n = 0
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            while n < nbytes:
+                buf = resp.read(65536)
+                if not buf:
+                    break
+                n += len(buf)
+                if time.monotonic() - t0 > timeout:
+                    break
+        dt = time.monotonic() - t0
+        if n <= 0 or dt <= 0:
+            return 0.0
+        return n / 1024.0 / dt
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def rank_sources(urls, timeout=PROBE_TIMEOUT, on_probe_done=None):
+    """并发探活后排出尝试顺序。
+
+    排序规则（刻意不做「全局按速度排序」—— 小样本测不出 CDN 镜像的真实能力，
+    而且会让自有服务器在偶尔测速偏高时插到镜像前面，违背「镜像优先、本站兜底」）：
+      组优先：0 = 加速镜像 → 1 = GitHub 直链 → 2 = 自有服务器（**永远兜底**）
+      组内：① 健康的（达到 MIN_USEFUL_SPEED）在前；
+            ② 再按探测速度降序；
+            ③ 最后按原顺序，保证结果稳定可复现。
+    探测失败 / 过慢的源都**不丢弃**，只是排到本组末尾，最后仍会试一次。
+    on_probe_done(dict url→KB/s) 供日志记录。
+    """
+    urls = [u for u in (urls or []) if u]
+    if len(urls) <= 1:
+        return list(urls)
+
+    speeds = {}
+    lock = threading.Lock()
+
+    def _one(u):
+        s = probe_speed(u, timeout=timeout)
+        with lock:
+            speeds[u] = s
+
+    threads = [threading.Thread(target=_one, args=(u,), daemon=True) for u in urls]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 2)
+
+    if on_probe_done:
+        try:
+            on_probe_done(speeds)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _key(item):
+        idx, u = item
+        s = speeds.get(u, 0.0)
+        healthy = s >= MIN_USEFUL_SPEED / 1024.0
+        return (
+            _src_rank(u),           # 组：0 加速镜像 → 1 GitHub 原站 → 2 自有服务器（兜底）
+            0 if healthy else 1,    # 组内：健康的在前，探测失败的排后（但不丢弃）
+            -s,                     # 组内再按实测速度降序
+            idx,                    # 最后按原顺序，保证结果稳定可复现
+        )
+
+    return [u for _, u in sorted(enumerate(urls), key=_key)]
+
+
 # ---------------- 版本比较 ----------------
 def parse_version(v):
     """'v1.2.3' / '1.4' → 可比较的数字元组。"""
@@ -211,14 +369,34 @@ def _file_sha256(path):
     return h.hexdigest()
 
 
-def fetch_update_info(latest_api_url, timeout=8, log_fn=None):
-    """依次尝试「自有服务器 → GitHub API」，返回统一的更新信息 dict 或 None。
+def _release_meta_url(api_url):
+    """从 GitHub API 地址推出「Release 附件里的 update.json」地址。
 
-    自有服务器上的 update.json 由各仓库的发版脚本生成、随 Release 上传、
-    再由服务器定时脚本抄到 /updates/<app>.json。它同时给出
-        url          自有服务器直链（首选，国内快）
-        fallback_url GitHub Release 直链（服务器没同步到 / 不可达时兜底）
-    两级都失败返回 None —— 静默失败，绝不因为检查更新把软件卡住。
+    https://api.github.com/repos/<owner>/<repo>/releases/latest
+        → https://github.com/<owner>/<repo>/releases/latest/download/update.json
+
+    附件由各仓库发版脚本在同一次发布操作里上传，与版本严格同步（自带 sha256）。
+    """
+    m = re.search(r"repos/([^/]+/[^/]+)/releases", str(api_url or ""))
+    if not m:
+        return None
+    return "https://github.com/%s/releases/latest/download/update.json" % m.group(1)
+
+
+def fetch_update_info(latest_api_url, timeout=5, log_fn=None):
+    """按「加速镜像 → GitHub 原站 → 自有服务器 → GitHub API」依次尝试取更新信息。
+
+    2026-09-22 调整：源顺序反转 —— 主源改为 GitHub 加速镜像，自有服务器退为兜底。
+    起因是实测裸网直连 GitHub 只有 3.7 KB/s，而镜像能到 439 KB/s；自有服务器
+    受阿里云 ECS 固定带宽限制封顶 445 KB/s，已不再有速度优势。
+
+    为什么 update.json 必须排在 GitHub API 之前：
+        只有 update.json 带 sha256，是完整性校验的唯一依据；
+        API 不返回该字段，优先走 API 等于每次都把校验跳过。
+
+    timeout 默认 5 秒：候选共 5 个，最坏全挂要等约 25 秒；正常情况下
+    第一个源不到 1 秒就返回（后台静默检查跑在独立线程，不会卡住界面）。
+    全部失败返回 None —— 静默失败，绝不因为检查更新把软件卡住。
     """
     def _log(m):
         try:
@@ -227,26 +405,35 @@ def fetch_update_info(latest_api_url, timeout=8, log_fn=None):
         except Exception:  # noqa: BLE001
             pass
 
-    meta_url = _server_meta_url(latest_api_url)
-    if meta_url:
-        try:
-            d = _http_json(meta_url, timeout)
-            if isinstance(d, dict) and d.get("version") and d.get("url"):
-                urls = [u for u in (d.get("url"), d.get("fallback_url")) if u]
-                _log("已从自有服务器获取版本信息：v%s" % d["version"])
-                return {
-                    "tag": str(d["version"]).strip(),
-                    "notes": d.get("notes") or "",
-                    "download_url": urls[0],
-                    "download_urls": urls,
-                    "sha256": (d.get("sha256") or "").strip().lower(),
-                    "html_url": d.get("release_url", ""),
-                    "source": "自有服务器",
-                }
-        except Exception:  # noqa: BLE001
-            pass
+    meta_urls = []
+    rel = _release_meta_url(latest_api_url)
+    if rel:
+        for p in MIRROR_PREFIXES:
+            meta_urls.append((p + rel, _src_label(p + rel)))
+        meta_urls.append((rel, _src_label(rel)))
+    srv = _server_meta_url(latest_api_url)
+    if srv:
+        meta_urls.append((srv, "自有服务器"))
 
-    return fetch_latest_release(latest_api_url, timeout=timeout)
+    for url, source in meta_urls:
+        try:
+            d = _http_json(url, timeout)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(d, dict) and d.get("version") and d.get("url"):
+            urls = [u for u in (d.get("url"), d.get("fallback_url")) if u]
+            _log("已从 %s 获取版本信息：v%s" % (source, d["version"]))
+            return {
+                "tag": str(d["version"]).strip(),
+                "notes": d.get("notes") or "",
+                "download_url": urls[0],
+                "download_urls": urls,
+                "sha256": (d.get("sha256") or "").strip().lower(),
+                "html_url": d.get("release_url", ""),
+                "source": source,
+            }
+
+    return fetch_latest_release(latest_api_url, timeout=10)
 
 
 # ---------------- 就地更新（Windows，不借助外部脚本） ----------------
@@ -633,6 +820,10 @@ class UpdateDialog(tk.Toplevel):
 
 
 # ---------------- 下载进度对话框（速度 / 进度 / 取消） ----------------
+class _SwitchedSource(Exception):
+    """下载速度过低、主动换源续传 —— 属正常调度，不是失败（已下载字节会被保留）。"""
+
+
 class DownloadProgressDialog(tk.Toplevel):
     """共享状态 + UI 轮询模式：下载线程只写 _state，UI 每 150ms 刷新，不积压。"""
 
@@ -659,8 +850,10 @@ class DownloadProgressDialog(tk.Toplevel):
         self._on_before_install = on_before_install
 
         self._cancel_evt = threading.Event()
+        self._has_spare = False
         self._state = {"done": 0, "total": 0, "running": True,
-                       "error": None, "cancelled": False, "result": None}
+                       "error": None, "cancelled": False, "result": None,
+                       "phase": "准备中…", "src": "", "idx": 0, "cnt": 0}
 
         frm = ttk.Frame(self, padding=(18, 16))
         frm.pack(fill="both", expand=True)
@@ -676,7 +869,10 @@ class DownloadProgressDialog(tk.Toplevel):
         self.lbl_info = ttk.Label(frm, text="准备中…", font=("Microsoft YaHei", 10))
         self.lbl_info.pack(anchor="w", pady=(8, 0))
         self.lbl_speed = ttk.Label(frm, text="速度：—", font=("Microsoft YaHei", 10), foreground="#555")
-        self.lbl_speed.pack(anchor="w", pady=(2, 10))
+        self.lbl_speed.pack(anchor="w", pady=(2, 0))
+        self.lbl_src = ttk.Label(frm, text="下载源：正在选择…", font=("Microsoft YaHei", 9),
+                                 foreground="#8a94a6")
+        self.lbl_src.pack(anchor="w", pady=(2, 10))
 
         tk.Button(frm, text="取消更新", command=self._on_cancel,
                   font=("Microsoft YaHei", 10),
@@ -687,66 +883,130 @@ class DownloadProgressDialog(tk.Toplevel):
 
         self.update_idletasks()
         w = 460
-        x, y = _center_on(master, w, 190)
-        self.geometry("%dx%d+%d+%d" % (w, 190, x, y))
+        x, y = _center_on(master, w, 210)
+        self.geometry("%dx%d+%d+%d" % (w, 210, x, y))
 
         threading.Thread(target=self._worker, daemon=True).start()
         self.after(self.POLL_MS, self._poll)
 
     # ---- 下载线程 ----
+    def _log_speeds(self, speeds):
+        if not self._log_fn:
+            return
+        try:
+            items = sorted(speeds.items(), key=lambda kv: -kv[1])
+            txt = "、".join("%s %.0fKB/s" % (_src_label(u), s) for u, s in items)
+            self._log_fn("测速结果：%s" % txt)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _download_one(self, url, tmp, done, st):
+        """从单个源下载（done>0 时用 Range 续传）。返回累计已下载字节数。
+
+        速度长期过低且还有备选源时抛 _SwitchedSource，已下载字节保留给下个源续传。
+        """
+        headers = {"User-Agent": UA, "Accept": "*/*"}
+        if done > 0:
+            headers["Range"] = "bytes=%d-" % done
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = getattr(resp, "status", 200)
+            if done > 0 and status != 206:
+                # 该源不支持断点续传（或忽略了 Range）→ 只能从头下
+                done = 0
+                st["done"] = 0
+            try:
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total:
+                st["total"] = total + done if status == 206 else total
+                total = st["total"]
+            mode = "ab" if (done > 0 and status == 206) else "wb"
+            win_t0, win_bytes = time.monotonic(), 0
+            with open(tmp, mode) as f:
+                while True:
+                    if self._cancel_evt.is_set():
+                        raise IOError("cancelled")
+                    buf = resp.read(65536)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    done += len(buf)
+                    win_bytes += len(buf)
+                    st["done"] = done
+                    # 换源看门狗：连续 8 秒平均速度仍低于门限 → 换源续传
+                    elapsed = time.monotonic() - win_t0
+                    if elapsed >= 8.0:
+                        if win_bytes / elapsed < SWITCH_SPEED and self._has_spare:
+                            raise _SwitchedSource(
+                                "%s 速度仅 %.0fKB/s，换源续传" % (_src_label(url), win_bytes / 1024 / elapsed))
+                        win_t0, win_bytes = time.monotonic(), 0
+        return done
+
     def _worker(self):
         st = self._state
         tmp = os.path.join(tempfile.gettempdir(), "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
+        sources = build_download_sources(self._urls)
+        if not sources:
+            st["error"] = IOError("没有可用的下载地址")
+            st["running"] = False
+            return
+
+        # 阶段一：并发探活，把死源/病源挪到队尾（镜像优先，其次自有服务器）
+        if len(sources) > 1:
+            st["phase"] = "正在选择最快的下载源…"
+            sources = rank_sources(sources, on_probe_done=self._log_speeds)
+        st["phase"] = "下载中"
+
+        done = 0
         last_err = None
-        # 多源依次尝试：自有服务器直链 → GitHub 直链（见 fetch_update_info）
-        for idx, url in enumerate(self._urls, 1):
+        for idx, url in enumerate(sources, 1):
             if self._cancel_evt.is_set():
                 break
+            self._has_spare = idx < len(sources)
+            st["src"] = _src_label(url)
+            st["idx"] = idx
+            st["cnt"] = len(sources)
             try:
-                st["done"] = 0
-                st["total"] = 0
-                if idx > 1:
-                    st["note"] = "源 %d/%d" % (idx, len(self._urls))
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": UA, "Accept": "*/*"}, method="GET")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    try:
-                        total = int(resp.headers.get("Content-Length", 0) or 0)
-                    except (TypeError, ValueError):
-                        total = 0
-                    st["total"] = total
-                    done = 0
-                    with open(tmp, "wb") as f:
-                        while True:
-                            if self._cancel_evt.is_set():
-                                raise IOError("cancelled")
-                            buf = resp.read(65536)
-                            if not buf:
-                                break
-                            f.write(buf)
-                            done += len(buf)
-                            st["done"] = done
+                done = self._download_one(url, tmp, done, st)
                 if self._cancel_evt.is_set():
                     raise IOError("cancelled")
-                if total and done != total:
-                    raise IOError("下载不完整（%d / %d 字节）" % (done, total))
+                if done <= 0:
+                    raise IOError("未收到数据")
+                want = st.get("total") or 0
+                if want and done < want:
+                    raise IOError("下载不完整（%d / %d 字节）" % (done, want))
                 if os.path.getsize(tmp) < 100000:
                     raise IOError("下载文件过小，疑似失败")
-                if self._sha256 and not _file_sha256(tmp) == self._sha256:
+                if self._sha256 and _file_sha256(tmp) != self._sha256:
                     raise IOError("文件校验失败（SHA256 不一致），已丢弃")
                 st["result"] = tmp
                 st["running"] = False
                 return
+            except _SwitchedSource as e:
+                # 主动换源：保留已下载字节，下个源用 Range 续传
+                last_err = e
+                if self._log_fn:
+                    try:
+                        self._log_fn("下载换源：%s" % e)
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
             except Exception as e:  # noqa: BLE001
                 if self._cancel_evt.is_set():
                     break
                 last_err = e
+                # 数据可能已损坏/不完整 → 清掉重来，不做跨源续传
+                done = 0
+                st["done"] = 0
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 except OSError:
                     pass
                 continue
+
         if self._cancel_evt.is_set():
             st["error"] = IOError("cancelled")
         else:
@@ -780,9 +1040,14 @@ class DownloadProgressDialog(tk.Toplevel):
             pct = int(done * 100 / total)
             self.lbl_info.configure(text="%s / %s (%d%%)" % (self._fmt(done), self._fmt(total), pct))
         else:
-            self.lbl_info.configure(text="已下载 %s" % self._fmt(done))
+            self.lbl_info.configure(text=st.get("phase") or ("已下载 %s" % self._fmt(done)))
         if hasattr(self, "_ema"):
             self.lbl_speed.configure(text="速度：%s/s" % self._fmt(self._ema))
+        src = st.get("src") or ""
+        if src:
+            self.lbl_src.configure(text="下载源：%s（第 %d/%d 个）" % (src, st.get("idx", 1), st.get("cnt", 1)))
+        else:
+            self.lbl_src.configure(text="下载源：%s" % (st.get("phase") or "正在选择…"))
 
         if st["cancelled"]:
             self._finish(cancelled=True)
