@@ -191,6 +191,13 @@
      含版本号 / 更新说明 / 服务器直链 / GitHub 兜底直链。取到就优先用它。 */
   var SERVER_META = 'http://47.116.64.26:8888/updates/court.json';
   var serverOK = false;
+  /* GitHub 加速镜像（2026-09-22）：浏览器直接点 GitHub 直链，在国内基本下不动；
+     而自有服务器元数据又可能取不到（跨域被拦 / 服务器尚未同步），
+     此时用镜像前缀拼出下载链接 —— 与软件内自动更新用的是同一批镜像。
+     ⚠️ 镜像属第三方服务、可能失效；换源时本处与 autoupdate.py 的
+        MIRROR_PREFIXES 要一起改，别只改一边。 */
+  var MIRROR = 'https://gh-proxy.com/';
+  function fast(u){ return u ? MIRROR + u : u; }
   var box = document.getElementById('logBox');
 
   function fmtDate(s){
@@ -247,14 +254,16 @@
         else if(/\.exe$/i.test(a.name)) green = a;
       }
       if(green){
-        /* 服务器元数据已点亮按钮时不要覆盖：那只走 GitHub，国内会更慢 */
+        /* 服务器元数据已点亮按钮时不要覆盖：那只走 GitHub，国内会更慢。
+           真要覆盖时用加速镜像拼链，否则国内点直链基本下不动。 */
         if(!serverOK){
-          document.getElementById('dlGreen').href = green.browser_download_url;
+          document.getElementById('dlGreen').href = fast(green.browser_download_url);
           document.getElementById('dlMeta').textContent = 'Windows 10/11 · 绿色版 ' + fmtMB(green.size) +
-            (setup ? ' / 安装版 ' + fmtMB(setup.size) : '') + ' · 均含数字签名 · 历史版本见 GitHub Releases';
+            (setup ? ' / 安装版 ' + fmtMB(setup.size) : '') +
+            ' · 均含数字签名 · 经加速镜像下载，若失败请到 GitHub Releases';
         }
       }
-      if(setup && !serverOK) document.getElementById('dlSetup').href = setup.browser_download_url;
+      if(setup && !serverOK) document.getElementById('dlSetup').href = fast(setup.browser_download_url);
       /* 更新日志 */
       var html = '';
       for(var k=0;k<list.length;k++){

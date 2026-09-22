@@ -54,7 +54,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.1"
+VERSION = "2.2"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
