@@ -35,7 +35,7 @@
 | 版本      | 文件名                    | 特点                                                           |
 | ------- | ---------------------- | ------------------------------------------------------------ |
 | **安装版** | `法院文书下载器_安装版_vX.Y.exe` | 双击安装，自动创建开始菜单 + 桌面快捷方式，可在系统「已安装的应用」里卸载。**仅为当前用户安装，不需要管理员权限** |
-| **绿色版** | `法院文书下载器.exe`          | 免安装单文件，放哪都能跑，拷到 U 盘也行                                        |
+| **绿色版** | `法院文书下载器_vX.Y.exe`     | 免安装单文件，放哪都能跑，拷到 U 盘也行。文件名自带版本号，一眼看出是哪个版本（安装到系统后则显示为固定的 `法院文书下载器.exe`） |
 
 两种版本功能完全一致，且都支持内置自动更新。程序会自动记住你的所有设置，换版本也不会丢。
 
@@ -61,7 +61,7 @@ pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
   --name CourtDocDownloader court_doc_downloader_gui.py
 ```
 
-产物 `dist/CourtDocDownloader.exe` 重命名为 `法院文书下载器.exe` 即可。
+产物 `dist/CourtDocDownloader.exe` 重命名为 `法院文书下载器_vX.Y.exe` 即可（一键发版脚本 `release_all.py` 会自动完成改名与归档）。
 
 **安装包**（需先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)）：
 

@@ -19,6 +19,8 @@
 #ifndef AppVersion
   #define AppVersion "1.8"
 #endif
+; 绿色版 exe 的来源路径：由 release_all.py 用 /DSrcExe="..." 传入（带版本号的文件名）。
+; 默认值仅为手工编译时的兜底。
 #ifndef SrcExe
   #define SrcExe "dist\法院文书下载器.exe"
 #endif
@@ -82,7 +84,10 @@ Name: "chs"; MessagesFile: "installer\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
-Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
+; ⚠️ 绿色版 exe 的「产物名」带版本号（法院文书下载器_v2.5.exe），但安装到系统后
+;    必须叫固定的「法院文书下载器.exe」—— 否则快捷方式/自动更新/卸载清理全对不上。
+;    用 DestName 把带版本号的源文件落地成固定名。
+Source: "{#SrcExe}"; DestDir: "{app}"; DestName: "{#AppName}.exe"; Flags: ignoreversion
 Source: "assets\app.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion

@@ -56,7 +56,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.4"
+VERSION = "2.5"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -136,8 +136,9 @@ def apply_window_icon(win):
 # 标准案号，如 (2025)苏0505民初7780号 / （2025）苏05民终1234号
 # 结构：[年度] + 法院代字(汉字+可选数字) + 案件类型(民/刑/行/执/商) + 程序(初/终/再/申/保/特/监/破…) + 序号 + 号
 _CASE_RE = re.compile(
-    r"[\(（](\d{4})[\)）]\s*[一-龥]{1,6}\d{0,6}\s*"
-    r"(?:民|刑|行|执|商|赔|认)[初终再申保特监破执异复撤销核催督催告]?\s*\d+\s*号"
+    r"[\(（](\d{4})[\)）]\s*[\u4e00-\u9fa5]{1,8}\d{0,6}\s*"
+    r"(?:民|刑|行|执|商|赔|认)\d{0,4}"
+    r"[初终再申保特监破执异复撤销核催督催告]{0,2}\s*\d{1,8}\s*号"
 )
 
 
@@ -1080,18 +1081,24 @@ class App:
             messagebox.showwarning("路径为空", "请填写或选择保存路径。")
             return
         # ③ 路径预校验：父目录必须可写、能创建
+        test_file = os.path.join(self.out_dir, ".wb_write_test")
         try:
             os.makedirs(self.out_dir, exist_ok=True)
-            test_file = os.path.join(self.out_dir, ".wb_write_test")
             with open(test_file, "w") as f:
                 f.write("0")
-            os.remove(test_file)
         except OSError as e:
             messagebox.showerror(
                 "保存路径不可用",
                 "无法写入所选路径：\n%s\n\n请改选一个有写入权限的文件夹。" % e,
             )
             return
+        finally:
+            # 无论成功失败都尝试清掉探针文件，避免在用户目录留垃圾
+            try:
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+            except OSError:
+                pass
         tasks = extract_tasks(text)
         if not tasks:
             messagebox.showwarning("无法识别", "未能从文本中提取到送达链接（需含 qdbh/sdbh/sdsin）。")
@@ -1134,7 +1141,24 @@ class App:
         self.root.destroy()
 
     def _force_close(self):
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _ui(self, fn):
+        """把回调安全地排到主线程；窗口已销毁时静默丢弃，绝不抛异常。
+
+        worker 线程在收尾阶段（弹提示、复位按钮、打开文件夹）都要用它：
+        用户点「关闭」后 _force_close 会 destroy 窗口，此时 Tk 对象已失效，
+        任何 self.root.after 都会抛 TclError —— 该异常发生在非主线程，
+        会污染整个 worker 的 finally 块，导致按钮状态/标志位复位不全。
+        """
+        try:
+            if self.root.winfo_exists():
+                self.root.after(0, fn)
+        except Exception:  # noqa: BLE001
+            pass
 
     def worker(self, tasks):
         ctx = ssl.create_default_context()
@@ -1163,7 +1187,9 @@ class App:
                 total_docs += len(docs)
                 self.set_bar(total_docs, done_count)
 
-                court = docs[0].get("c_fymc", "未知法院")
+                # ⚠️ 键存在但值为 None 时 get 的默认值不生效 → 必须再 or 一次，
+                #    否则下面 court + "_" 会抛 TypeError（接口换版本时踩过）。
+                court = docs[0].get("c_fymc") or "未知法院"
                 caseno = params["caseno"] or ""
                 base = self.out_dir or default_out_dir()
                 os.makedirs(base, exist_ok=True)
@@ -1289,27 +1315,29 @@ class App:
             if cancelled:
                 self.log_msg("")
                 self.log_msg("=== 已取消：成功 %d / %d 份 ===" % (total_ok, max(total_all, done_count)))
-                self.root.after(0, lambda: messagebox.showinfo(
+                self._ui(lambda: messagebox.showinfo(
                     "已取消", "下载已取消。成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
             else:
                 self.log_msg("")
                 self.log_msg("=== 全部完成：成功 %d / %d 份（%d 个案件）===" % (total_ok, total_all, len(tasks)))
                 if total_ok < total_all:
-                    self.root.after(0, lambda: messagebox.showwarning(
+                    self._ui(lambda: messagebox.showwarning(
                         "部分失败", "成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
                 else:
-                    self.root.after(0, lambda: messagebox.showinfo(
+                    self._ui(lambda: messagebox.showinfo(
                         "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (len(tasks), total_ok)))
                 # 模式：打开保存根目录（批量时可见所有案件子文件夹）
                 if self.auto_open_mode == AUTO_OPEN_ROOT and self.out_dir and os.path.isdir(self.out_dir):
                     self.root.after(50, self.open_base_folder)
         except Exception as e:  # noqa: BLE001
             self.log_msg("✗ 出错了：%s" % e)
-            self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+            self._ui(lambda: messagebox.showerror("错误", str(e)))
         finally:
+            # ⚠️ 收尾动作全部走 _ui()：窗口可能已被用户关掉（_force_close 已 destroy），
+            #    此时直接调 self.root.after 会抛 TclError，把 worker 线程弄崩。
             self.running = False
             self.stop_event.clear()
-            self.root.after(0, lambda: self.btn_start.configure(
+            self._ui(lambda: self.btn_start.configure(
                 state="normal", text="开始下载", command=self.on_start))
 
 

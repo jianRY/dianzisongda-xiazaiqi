@@ -70,9 +70,12 @@ def parse_params(text):
         return None
     # 顺便尝试从短信正文里抠出标准案号，例如 (2025)苏0505民初7780号
     # 结构：[年度] + 法院代字(汉字+可选数字) + 案件类型 + 程序 + 序号 + 号
+    # ⚠️ 与 GUI 版保持一致：真实案号里汉字与「民」之间会夹法院代码数字
+    #    （如「苏0505民初7780号」），各段都必须允许可选数字，否则永远匹配不到。
     m = re.search(
-        r"[\(（](\d{4})[\)）]\s*[一-龥]{1,6}\d{0,6}\s*"
-        r"(?:民|刑|行|执|商|赔|认)[初终再申保特监破执异复撤销核催督催告]?\s*\d+\s*号",
+        r"[\(（](\d{4})[\)）]\s*[\u4e00-\u9fa5]{1,8}\d{0,6}\s*"
+        r"(?:民|刑|行|执|商|赔|认)\d{0,4}"
+        r"[初终再申保特监破执异复撤销核催督催告]{0,2}\s*\d{1,8}\s*号",
         text,
     )
     caseno = m.group(0) if m else ""
@@ -126,16 +129,23 @@ def download_file(url, path, ctx):
                 method="GET",
             )
             with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
-                chunk = 4096
+                # 与 GUI 版一致：读 Content-Length，下完比对，提早发现半截包
+                expect = resp.headers.get("Content-Length")
+                expect = int(expect) if expect and expect.isdigit() else None
+                chunk = 65536
                 with open(path, "wb") as f:
                     while True:
                         buf = resp.read(chunk)
                         if not buf:
                             break
                         f.write(buf)
-            # 校验：0 字节 / 拿到的是错误页（OSS 出错会返回 XML/HTML）
-            if os.path.getsize(path) == 0:
+            # 校验：0 字节 / 完整性 / 拿到的是错误页（OSS 出错会返回 XML/HTML）
+            got = os.path.getsize(path)
+            if got == 0:
                 raise IOError("下载到 0 字节")
+            if expect is not None and got != expect:
+                os.remove(path)
+                raise IOError("下载不完整（收到 %d / 应为 %d 字节）" % (got, expect))
             with open(path, "rb") as f:
                 head = f.read(32)
             low = head.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
@@ -236,7 +246,9 @@ def main():
     log("✓ 共找到 %d 份文书" % len(docs))
 
     # 决定文件夹名
-    court = docs[0].get("c_fymc", "未知法院")
+    # ⚠️ 键存在但值为 None 时 get 的默认值不生效 → 必须再 or 一次，
+    #    否则下一行 court + "_" 会抛 TypeError。
+    court = docs[0].get("c_fymc") or "未知法院"
     caseno = params["caseno"] or ""
     folder_name = sanitize_filename((court + ("_" + caseno if caseno else "")).strip("_ "))
     out_dir = os.path.join(args.out, folder_name)
