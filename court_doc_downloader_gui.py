@@ -15,7 +15,7 @@
         ① 所有图片统一放进案件下的“图片”文件夹
         ② 按 PDF 文件名各自建子文件夹存放对应图片（多页自动加页码）
     - 带进度条（份数 + 百分比），实时显示“已下载 / 总份数 (xx%)”
-    - 下载中按钮变为“⏸ 取消下载”，点击可中途取消未完成的任务
+    - 下载中按钮变为“取消下载”，点击可中途取消未完成的任务
     - 每个案件自动建子文件夹：法院名_案号_启动时间戳\（时间戳为年月日时分秒纯数字，避免同名法院不同链接合并）
 
 原理（与命令行版一致，已实测）：
@@ -36,6 +36,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import ui_kit as K  # 必须最先导入：模块导入时即启用 DPI 感知（先于 tkinter）
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -54,7 +56,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.2"
+VERSION = "2.3"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -546,115 +548,165 @@ class App:
         self._cancel_lock = threading.Lock()  # 保护 last_case_dir / 计数等共享状态
 
         root.title("法院文书下载器 v" + VERSION)
-        root.geometry("640x690")
         root.resizable(True, True)
         apply_window_icon(root)
+        # DPI 感知已在 import ui_kit 时生效；这里取缩放比并统一 ttk 扁平样式
+        K.setup_scale(root)
+        K.style_ttk()
         # 窗口关闭保护：下载中先确认并置取消信号，避免半途强杀留下半成品文件
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        sk = K.SKIN
+        root.configure(bg=sk.bg)
+        pad_x = 14
+        win_w, win_h = 860, 780
+        avail_w = int(root.winfo_screenwidth() / K.SCALE) - 40
+        avail_h = int(root.winfo_screenheight() / K.SCALE) - 90
+        win_w, win_h = min(win_w, avail_w), min(win_h, avail_h)
+        root.geometry("%dx%d" % (K.u(win_w), K.u(win_h)))
 
         # 顶部菜单栏
         self._build_menubar()
 
-        # ① 粘贴区
-        frm1 = ttk.Frame(root)
-        frm1.pack(fill="x", padx=12, pady=(10, 2))
-        ttk.Label(frm1, text="① 粘贴法院送达短信或链接（支持批量：多个链接自动依次下载）", font=("Microsoft YaHei", 10)).pack(side="left")
-        ttk.Button(frm1, text="🗑 清空", command=self.clear_text).pack(side="right")
-        ttk.Button(frm1, text="📋 粘贴", command=self.paste_text).pack(side="right", padx=(0, 4))
-        self.text_in = scrolledtext.ScrolledText(
-            root, height=6, wrap="word", font=("Microsoft YaHei", 10)
-        )
-        self.text_in.pack(fill="x", padx=12)
+        # ── 顶栏：深蓝底 + 金色 logo + 标题/副标 ──
+        hd = tk.Canvas(root, height=K.u(60), highlightthickness=0, bd=0, bg=sk.bg)
+        hd.pack(fill="x")
+
+        def _paint_header(_e=None):
+            if not hd.winfo_exists():
+                return
+            hd.delete("all")
+            w, h = hd.winfo_width(), hd.winfo_height()
+            if w < 10:
+                return
+            K.rr(hd, 0, 0, w, h, 0, sk.header)
+            gx, gy, gs = K.u(18), K.u(12), K.u(36)
+            K.rr(hd, gx, gy, gx + gs, gy + gs, K.u(8), sk.gold)
+            for i, t in enumerate((0.36, 0.50, 0.64)):
+                hd.create_line(gx + gs * 0.26, gy + gs * t,
+                               gx + gs * (0.74 if i < 2 else 0.58), gy + gs * t,
+                               fill=sk.header, width=K.u(2), capstyle="round")
+            hd.create_text(gx + gs + K.u(14), h / 2, text="法院文书下载器",
+                           font=K.f(14, True), fill="#FFFFFF", anchor="w")
+            hd.create_text(w - K.u(18), h / 2,
+                           text="全国法院统一送达平台 · v" + VERSION,
+                           font=K.f(9), fill=sk.header_text_dim, anchor="e")
+        hd.bind("<Configure>", _paint_header)
+
+        # ── 卡1：① 粘贴区 ──
+        c1 = K.Card(root, pad=12)
+        c1.pack(fill="x", padx=K.u(pad_x), pady=(K.u(12), 0))
+        row1 = tk.Frame(c1.body, bg=sk.card)
+        row1.pack(fill="x")
+        tk.Label(row1, text="① 送达短信 / 链接", font=K.f(10, True),
+                 bg=sk.card, fg=sk.text).pack(side="left")
+        tk.Label(row1, text="支持批量：多条链接自动依次下载", font=K.f(8),
+                 bg=sk.card, fg=sk.faint).pack(side="left", padx=(K.u(8), 0))
+        K.RoundButton(row1, text="清空", command=self.clear_text, kind="ghost",
+                      height=30, font_size=9, width=64).pack(side="right")
+        K.RoundButton(row1, text="粘贴", command=self.paste_text, kind="ghost",
+                      height=30, font_size=9, width=64).pack(side="right", padx=(0, K.u(6)))
+        wrap_in = tk.Frame(c1.body, bg=sk.card)
+        wrap_in.pack(fill="x", pady=(K.u(6), 0))
+        self.text_in = tk.Text(wrap_in, height=5, wrap="word", font=K.f(9),
+                               bg=sk.card, fg=sk.text, bd=0, highlightthickness=0,
+                               padx=K.u(6), pady=K.u(4))
+        sb_in = ttk.Scrollbar(wrap_in, orient="vertical", style="P.Vertical.TScrollbar",
+                              command=self.text_in.yview)
+        self.text_in.configure(yscrollcommand=sb_in.set)
+        sb_in.pack(side="right", fill="y")
+        self.text_in.pack(side="left", fill="both", expand=True)
         self._init_placeholder()
         self._build_ctx_menu()
 
-        # ② 保存路径
-        frm = ttk.Frame(root)
-        frm.pack(fill="x", padx=12, pady=(8, 2))
-        ttk.Label(frm, text="② 保存路径：", font=("Microsoft YaHei", 10)).pack(side="left")
+        # ── 卡2：② 保存路径 ──
+        c2 = K.Card(root, pad=12)
+        c2.pack(fill="x", padx=K.u(pad_x), pady=(K.u(10), 0))
+        row2 = tk.Frame(c2.body, bg=sk.card)
+        row2.pack(fill="x")
+        tk.Label(row2, text="② 保存路径", font=K.f(10, True),
+                 bg=sk.card, fg=sk.text).pack(side="left")
         self.path_var = tk.StringVar(value=self.out_dir)
         self.path_var.trace_add("write", self._on_path_var_changed)
-        self.entry_path = ttk.Entry(frm, textvariable=self.path_var)
-        self.entry_path.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        ttk.Button(frm, text="选择路径…", command=self.choose_path).pack(side="left")
-        ttk.Button(frm, text="恢复默认", command=self.reset_path).pack(side="left", padx=(4, 0))
+        self.entry_path = ttk.Entry(row2, textvariable=self.path_var, style="P.TEntry")
+        self.entry_path.pack(side="left", fill="x", expand=True, padx=(K.u(10), K.u(8)))
+        self.entry_path.update_idletasks()
+        eh = self.entry_path.winfo_reqheight() / K.SCALE
+        K.RoundButton(row2, text="恢复默认", command=self.reset_path, kind="ghost",
+                      height=eh, font_size=9, width=76).pack(side="right")
+        K.RoundButton(row2, text="选择…", command=self.choose_path, kind="ghost",
+                      height=eh, font_size=9, width=64).pack(side="right", padx=(0, K.u(6)))
 
-        # ③ 选项：下载完成后打开文件夹
-        opt_box = ttk.LabelFrame(root, text="下载完成后打开文件夹")
-        opt_box.pack(fill="x", padx=12, pady=(2, 4))
+        # ── 卡3：③ 选项（原三个 LabelFrame 合并为一张卡） ──
+        c3 = K.Card(root, pad=12)
+        c3.pack(fill="x", padx=K.u(pad_x), pady=(K.u(10), 0))
+        # ③-a 下载完成后打开文件夹（原 Radiobutton 组 → 分段选择器）
+        r3a = tk.Frame(c3.body, bg=sk.card)
+        r3a.pack(fill="x")
+        tk.Label(r3a, text="③ 下载完成后", font=K.f(10, True),
+                 bg=sk.card, fg=sk.text).pack(side="left")
         self.auto_open_var = tk.IntVar(value=self.auto_open_mode)
         self.auto_open_var.trace_add("write", self._on_auto_open_changed)
-        ttk.Radiobutton(opt_box, text="不打开", variable=self.auto_open_var,
-                        value=AUTO_OPEN_OFF).pack(side="left", padx=8)
-        ttk.Radiobutton(opt_box, text="打开保存根目录", variable=self.auto_open_var,
-                        value=AUTO_OPEN_ROOT).pack(side="left", padx=8)
-        ttk.Radiobutton(opt_box, text="打开每个案件文件夹", variable=self.auto_open_var,
-                        value=AUTO_OPEN_EACH).pack(side="left", padx=8)
-
-        # ④ 选项：下载后自动转换为 JPG
-        jpg_box = ttk.LabelFrame(root, text="下载后转换为图片 (JPG)")
-        jpg_box.pack(fill="x", padx=12, pady=(2, 4))
+        self.auto_open_seg = K.SegmentedControl(
+            r3a,
+            [("off", "不打开"), ("root", "打开根目录"), ("each", "打开案件夹")],
+            self._auto_open_key(self.auto_open_mode),
+            command=self._on_auto_open_seg, width=260)
+        self.auto_open_seg.pack(side="left", padx=(K.u(10), 0))
+        # ③-b 下载后转换为 JPG
+        r3b = tk.Frame(c3.body, bg=sk.card)
+        r3b.pack(fill="x", pady=(K.u(9), 0))
         self.convert_var = tk.BooleanVar(value=self.convert_jpg)
         self.convert_var.trace_add("write", self._on_convert_changed)
-        ttk.Checkbutton(
-            jpg_box, text="自动将 PDF 转换为 JPG 图片（长边 2000px，高质量）",
-            variable=self.convert_var, command=self._sync_jpg_state,
-        ).pack(anchor="w", padx=8, pady=(2, 2))
         self.jpg_mode_var = tk.IntVar(value=self.jpg_mode)
         self.jpg_mode_var.trace_add("write", self._on_jpg_mode_changed)
-        self.jpg_sub = ttk.Frame(jpg_box)
-        self.jpg_sub.pack(anchor="w", padx=(18, 0), pady=(0, 4))
-        ttk.Radiobutton(self.jpg_sub, text="所有图片放在一个文件夹内",
-                        variable=self.jpg_mode_var, value=JPG_MODE_SINGLE).pack(side="left", padx=8)
-        ttk.Radiobutton(self.jpg_sub, text="按 PDF 文件名分别建文件夹",
-                        variable=self.jpg_mode_var, value=JPG_MODE_PERPDF).pack(side="left", padx=8)
-        self._sync_jpg_state()
-
-        # ⑤ 选项：跳过已存在的文件
-        skip_box = ttk.LabelFrame(root, text="重复下载处理")
-        skip_box.pack(fill="x", padx=12, pady=(2, 4))
+        self.jpg_seg = K.SegmentedControl(
+            r3b, [("single", "统一文件夹"), ("per", "按 PDF 分夹")],
+            "single" if self.jpg_mode == JPG_MODE_SINGLE else "per",
+            command=self._on_jpg_mode_seg, width=200)
+        self.jpg_seg.pack(side="right")
+        self.convert_check = K.RoundCheck(
+            r3b, text="转换为 JPG 图片（长边 2000px 高质量）",
+            variable=self.convert_var, command=self._sync_jpg_state)
+        self.convert_check.pack(side="left")
+        # ③-c 重复下载处理
+        r3c = tk.Frame(c3.body, bg=sk.card)
+        r3c.pack(fill="x", pady=(K.u(9), 0))
         self.skip_var = tk.BooleanVar(value=self.skip_existing)
         self.skip_var.trace_add("write", self._on_skip_existing_changed)
-        ttk.Checkbutton(
-            skip_box, text="跳过已存在的同名文书（同一案件重复下载时省时省流量）",
-            variable=self.skip_var,
-        ).pack(anchor="w", padx=8, pady=(2, 4))
+        K.RoundCheck(r3c, text="跳过已存在的同名文书（重复下载省时省流量）",
+                     variable=self.skip_var).pack(side="left")
 
-        # 开始按钮
-        self.btn_start = ttk.Button(
-            root, text="⬇ 开始下载", command=self.on_start, style="Big.TButton"
-        )
-        self.btn_start.pack(padx=12, pady=(8, 4), fill="x")
+        # ── 开始按钮 ──
+        self.btn_start = K.RoundButton(root, text="开始下载", command=self.on_start,
+                                       kind="primary", height=sk.btn_h, font_size=12)
+        self.btn_start.pack(fill="x", padx=K.u(pad_x), pady=(K.u(12), 0))
 
-        # 进度条
-        frm_prog = ttk.Frame(root)
-        frm_prog.pack(fill="x", padx=12, pady=(0, 4))
-        self.progress = ttk.Progressbar(frm_prog, orient="horizontal", mode="determinate", length=100)
-        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.progress_label = ttk.Label(frm_prog, text="进度：0 / 0 份", font=("Microsoft YaHei", 9), width=14)
-        self.progress_label.pack(side="left")
+        # ── 进度条 ──
+        prow = tk.Frame(root, bg=sk.bg)
+        prow.pack(fill="x", padx=K.u(pad_x), pady=(K.u(10), 0))
+        self.progress = K.RoundProgress(prow, height=9)
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.progress_label = ttk.Label(prow, text="进度：0 / 0 份 (0%)",
+                                        font=K.f(9), background=sk.bg,
+                                        foreground=sk.muted)
+        self.progress_label.pack(side="left", padx=(K.u(10), 0))
 
-        # 日志
-        ttk.Label(root, text="下载日志：", font=("Microsoft YaHei", 10)).pack(
-            anchor="w", padx=12, pady=(4, 2)
-        )
-        self.log = scrolledtext.ScrolledText(
-            root, height=12, wrap="word", state="disabled", font=("Consolas", 9)
-        )
-        self.log.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        # ── 日志（分级着色） ──
+        c4 = K.Card(root, pad=10, auto=False, fill=True)
+        c4.pack(fill="both", expand=True, padx=K.u(pad_x), pady=(K.u(10), 0))
+        self.logview = K.LogView(c4.body)
+        self.logview.pack(fill="both", expand=True)
+        self.log = self.logview.txt  # 兼容既有 log_msg / 配置读写
 
-        # 底部按钮（检查更新入口已移至菜单栏「更新 → 检查更新」，不再放窗口左下角）
-        frm2 = ttk.Frame(root)
-        frm2.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Button(frm2, text="打开保存文件夹", command=self.open_folder).pack(side="right")
-        ttk.Button(frm2, text="清空日志", command=self.clear_log).pack(side="right", padx=6)
-
-        # 让“开始下载”按钮醒目
-        style = ttk.Style()
-        try:
-            style.configure("Big.TButton", font=("Microsoft YaHei", 11, "bold"), padding=6)
-        except Exception:
-            pass
+        # ── 底部按钮 ──
+        brow = tk.Frame(root, bg=sk.bg)
+        brow.pack(fill="x", padx=K.u(pad_x), pady=(K.u(8), K.u(12)))
+        K.RoundButton(brow, text="打开保存文件夹", command=self.open_folder,
+                      kind="ghost", height=32, font_size=9,
+                      width=110).pack(side="right")
+        K.RoundButton(brow, text="清空日志", command=self.clear_log, kind="ghost",
+                      height=32, font_size=9, width=76).pack(side="right", padx=(0, K.u(6)))
 
         # 若本程序是由更新流程启动的，接管原文件名并清掉旧版文件。
         # 旧进程刚退出时文件可能还被锁着，模块内部会重试；放后台线程，不拖慢启动。
@@ -687,15 +739,10 @@ class App:
 
     def _log_msg(self, msg):
         ts = datetime.now().strftime("[%H:%M:%S] ")
-        self.log.configure(state="normal")
-        self.log.insert("end", ts + msg + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        self.logview.append(ts + msg)  # LogView 按内容自动分级着色
 
     def clear_log(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+        self.logview.clear()
 
     def choose_path(self):
         d = filedialog.askdirectory(initialdir=self.out_dir or get_desktop())
@@ -733,28 +780,36 @@ class App:
         self._save_cfg()
 
     def _sync_jpg_state(self):
-        # 未勾选“转 JPG”时，禁用目录模式单选
-        state = "normal" if self.convert_var.get() else "disabled"
-        for child in self.jpg_sub.winfo_children():
-            child.configure(state=state)
+        # 未勾选“转 JPG”时，禁用目录模式分段选择器
+        self.jpg_seg.set_enabled(bool(self.convert_var.get()))
+
+    # ---- 分段选择器 ↔ 配置变量（沿用原 trace 保存配置） ----
+    @staticmethod
+    def _auto_open_key(mode):
+        return {AUTO_OPEN_OFF: "off", AUTO_OPEN_ROOT: "root",
+                AUTO_OPEN_EACH: "each"}.get(mode, "root")
+
+    def _on_auto_open_seg(self, key):
+        self.auto_open_var.set({"off": AUTO_OPEN_OFF, "root": AUTO_OPEN_ROOT,
+                                "each": AUTO_OPEN_EACH}[key])
+
+    def _on_jpg_mode_seg(self, key):
+        self.jpg_mode_var.set(JPG_MODE_SINGLE if key == "single" else JPG_MODE_PERPDF)
 
     # ---- 进度条（线程安全）----
     def reset_bar(self):
         self.root.after(0, self._reset_bar)
 
     def _reset_bar(self):
-        self.progress["maximum"] = 1
-        self.progress["value"] = 0
+        self.progress.set_value(0)
         self.progress_label.configure(text="进度：0 / 0 份 (0%)")
 
     def set_bar(self, total, done):
         self.root.after(0, self._set_bar, total, done)
 
     def _set_bar(self, total, done):
-        if total > 0:
-            self.progress["maximum"] = total
-        self.progress["value"] = done
         pct = int(done * 100 / total) if total > 0 else 0
+        self.progress.set_value(pct, stopped=self.stop_event.is_set())
         self.progress_label.configure(text="进度：%d / %d 份 (%d%%)" % (done, total, pct))
 
     def open_folder(self):
@@ -775,7 +830,7 @@ class App:
         )
         self.is_placeholder = True
         self.text_in.insert("1.0", self.placeholder_text)
-        self.text_in.configure(fg="#9a9a9a")
+        self.text_in.configure(fg=K.SKIN.faint)
         self.text_in.bind("<FocusIn>", self._on_focus_in)
         self.text_in.bind("<FocusOut>", self._on_focus_out)
         self.text_in.bind("<<Paste>>", self._on_native_paste)
@@ -783,14 +838,14 @@ class App:
     def _clear_placeholder(self):
         if self.is_placeholder:
             self.text_in.delete("1.0", "end")
-            self.text_in.configure(fg="black")
+            self.text_in.configure(fg=K.SKIN.text)
             self.is_placeholder = False
 
     def _restore_placeholder(self):
         if not self.is_placeholder and self.text_in.get("1.0", "end").strip() == "":
             self.text_in.delete("1.0", "end")
             self.text_in.insert("1.0", self.placeholder_text)
-            self.text_in.configure(fg="#9a9a9a")
+            self.text_in.configure(fg=K.SKIN.faint)
             self.is_placeholder = True
 
     def _on_focus_in(self, *_):
@@ -808,7 +863,7 @@ class App:
         """清空按钮：删除全部内容并恢复置灰占位符。"""
         self.text_in.delete("1.0", "end")
         self.text_in.insert("1.0", self.placeholder_text)
-        self.text_in.configure(fg="#9a9a9a")
+        self.text_in.configure(fg=K.SKIN.faint)
         self.is_placeholder = True
         self.text_in.focus_set()
 
@@ -864,17 +919,26 @@ class App:
 
     def show_help(self):
         """使用说明窗口。"""
+        sk = K.SKIN
         win = tk.Toplevel(self.root)
         win.title("使用说明 · 法院文书下载器 v" + VERSION)
-        win.geometry("660x560")
+        win.configure(bg=sk.bg)
+        win.geometry("%dx%d" % (K.u(680), K.u(580)))
         win.resizable(True, True)
         apply_window_icon(win)
         try:
             win.transient(self.root)
         except Exception:
             pass
-        txt = scrolledtext.ScrolledText(win, wrap="word", font=("Microsoft YaHei", 10))
-        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        body = tk.Frame(win, bg=sk.card,
+                        highlightbackground=sk.border, highlightthickness=1)
+        body.pack(fill="both", expand=True, padx=K.u(14), pady=(K.u(14), 0))
+        txt = scrolledtext.ScrolledText(
+            body, wrap="word", font=K.f(10),
+            bg=sk.card, fg=sk.text, bd=0, highlightthickness=0,
+            padx=K.u(12), pady=K.u(10),
+        )
+        txt.pack(fill="both", expand=True)
         content = (
             "★ 项目仓库：https://github.com/jianRY/dianzisongda-xiazaiqi\n"
             "   （新版发布、历史版本下载都在这里，欢迎 Star）\n\n"
@@ -897,9 +961,9 @@ class App:
             "   · 重复下载处理：默认勾选「跳过已存在的同名文书」，\n"
             "     识别到案号时会复用上次的案件文件夹，已下过的文书直接跳过，\n"
             "     省时省流量；需要整案重新下载就先取消勾选。\n"
-            "4. 开始：点「⬇ 开始下载」，进度条实时显示「已下载 / 总份数 (百分比)」。\n"
+            "4. 开始：点「开始下载」，进度条实时显示「已下载 / 总份数 (百分比)」。\n"
             "   · 同一案件的多份文书会用 %d 个线程并发下载，速度更快。\n"
-            "   · 下载过程中按钮变为「⏸ 取消下载」，点击可中途取消未完成任务。\n"
+            "   · 下载过程中按钮变为「取消下载」，点击可中途取消未完成任务。\n"
             "   · 下载中直接关闭窗口会先询问，未完成文件会被清理。\n"
             "   · 每个案件会自动建子文件夹：法院名_案号_<启动时间戳>，\n"
             "     防止同名法院不同链接的文件被合并。\n\n"
@@ -926,7 +990,8 @@ class App:
         )
         txt.insert("1.0", content)
         txt.configure(state="disabled")
-        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 10))
+        K.RoundButton(win, text="关闭", command=win.destroy, kind="ghost",
+                      height=32, font_size=9, width=72).pack(pady=(K.u(10), K.u(12)))
 
     def show_about(self):
         messagebox.showinfo(
@@ -1012,7 +1077,7 @@ class App:
         # 重置取消标志
         self.stop_event.clear()
         self.running = True
-        self.btn_start.configure(state="normal", text="⏸ 取消下载", command=self.on_cancel)
+        self.btn_start.configure(state="normal", text="取消下载", command=self.on_cancel)
         self._log_msg("法院文书下载器 v%s" % VERSION)
         self._log_msg("✓ 识别到 %d 个送达链接，将依次下载。" % len(tasks))
         t = threading.Thread(target=self.worker, args=(tasks,), daemon=True)
@@ -1223,7 +1288,7 @@ class App:
             self.running = False
             self.stop_event.clear()
             self.root.after(0, lambda: self.btn_start.configure(
-                state="normal", text="⬇ 开始下载", command=self.on_start))
+                state="normal", text="开始下载", command=self.on_start))
 
 
 def main():
