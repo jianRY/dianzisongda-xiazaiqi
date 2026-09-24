@@ -1,9 +1,9 @@
 # 电子送达下载器（法院文书下载器）
 
-> **项目仓库：https://github.com/jianRY/dianzisongda-xiazaiqi**
+> **项目仓库：<https://github.com/jianRY/dianzisongda-xiazaiqi>**  
 > （新版发布、历史版本下载、问题反馈都在这里；两种版本：绿色单文件版 + 系统安装版，功能完全一致）
 >
-> **国内直连下载（推荐，速度快）：http://47.116.64.26:8888/**
+> **国内直连下载（推荐，速度快）：<http://47.116.64.26:8888/>**  
 > 两个版本都同步在国内服务器上，不用访问 GitHub；软件自带的自动更新也优先走这台服务器。
 
 全国法院统一送达平台电子送达文书自动下载工具。粘贴送达短信或链接，自动提取该案件全部文书并下载为 PDF，支持**多线程并发下载**、批量、转 JPG、防合并命名、自动更新（含更新内容展示 / 三选项 / 进度速度 / 随时取消）。
@@ -32,16 +32,17 @@
 
 ### 两种版本，按喜好任选
 
-| 版本 | 文件名 | 特点 |
-| --- | --- | --- |
+| 版本      | 文件名                    | 特点                                                           |
+| ------- | ---------------------- | ------------------------------------------------------------ |
 | **安装版** | `法院文书下载器_安装版_vX.Y.exe` | 双击安装，自动创建开始菜单 + 桌面快捷方式，可在系统「已安装的应用」里卸载。**仅为当前用户安装，不需要管理员权限** |
-| **绿色版** | `法院文书下载器.exe` | 免安装单文件，放哪都能跑，拷到 U 盘也行 |
+| **绿色版** | `法院文书下载器.exe`          | 免安装单文件，放哪都能跑，拷到 U 盘也行                                        |
 
 两种版本功能完全一致，且都支持内置自动更新。程序会自动记住你的所有设置，换版本也不会丢。
 
 > ⚠️ 绿色版请放在**有写入权限**的目录（桌面、文档等）。放在 `C:\Program Files` 这类只读目录里，自动更新会因无写入权限而失败。
 
 ### 源码运行
+
 依赖：Python 3、tkinter（系统 Python 自带）、PyMuPDF（仅转 JPG 时需要）
 
 ```bash
@@ -52,15 +53,18 @@ python court_doc_downloader_gui.py
 ### 自行打包
 
 **单文件 exe**：
+
 ```bash
 pip install pyinstaller pymupdf
 pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
   --icon assets/app.ico --add-data "assets/app.ico;assets" \
   --name CourtDocDownloader court_doc_downloader_gui.py
 ```
+
 产物 `dist/CourtDocDownloader.exe` 重命名为 `法院文书下载器.exe` 即可。
 
 **安装包**（需先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)）：
+
 ```bash
 python _project_upload/make_installer_assets.py     # 生成中文语言包与向导配图
 ISCC.exe installer.iss /DAppVersion=1.8
@@ -68,16 +72,16 @@ ISCC.exe installer.iss /DAppVersion=1.8
 
 ## 文件说明
 
-| 文件 | 说明 |
-| --- | --- |
-| `court_doc_downloader_gui.py` | 图形界面主程序（v1.8） |
-| `autoupdate.py` | 通用自动更新模块（三行接入，可复用到其他 Tkinter 软件） |
-| `court_doc_downloader.py` | 命令行版（零依赖，仅标准库 urllib） |
-| `installer.iss` | Inno Setup 安装包脚本（生成安装版） |
-| `installer/` | 安装包资源：简体中文语言包 + 向导配图 |
-| `CourtDocDownloader.spec` | PyInstaller 打包配置 |
-| `assets/app.ico` | 应用图标（16~256 共 7 种尺寸） |
-| `CHANGELOG.md` | 版本更新记录 |
+| 文件                            | 说明                               |
+| ----------------------------- | -------------------------------- |
+| `court_doc_downloader_gui.py` | 图形界面主程序（v1.8）                    |
+| `autoupdate.py`               | 通用自动更新模块（三行接入，可复用到其他 Tkinter 软件） |
+| `court_doc_downloader.py`     | 命令行版（零依赖，仅标准库 urllib）            |
+| `installer.iss`               | Inno Setup 安装包脚本（生成安装版）          |
+| `installer/`                  | 安装包资源：简体中文语言包 + 向导配图             |
+| `CourtDocDownloader.spec`     | PyInstaller 打包配置                 |
+| `assets/app.ico`              | 应用图标（16~256 共 7 种尺寸）             |
+| `CHANGELOG.md`                | 版本更新记录                           |
 
 ## 技术说明
 

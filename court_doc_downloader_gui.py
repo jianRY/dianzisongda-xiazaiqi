@@ -56,7 +56,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.3"
+VERSION = "2.4"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -568,9 +568,19 @@ class App:
         # 顶部菜单栏
         self._build_menubar()
 
-        # ── 顶栏：深蓝底 + 金色 logo + 标题/副标 ──
+        # ── 顶栏：深蓝底 + 软件图标 + 标题/副标 ──
         hd = tk.Canvas(root, height=K.u(60), highlightthickness=0, bd=0, bg=sk.bg)
         hd.pack(fill="x")
+
+        # 真实软件图标（assets/app_icon_288.png，圆角透明底，随包发货）。
+        # 引用必须挂在实例上，否则被 GC 回收后 Canvas 显示空白（缩放档同理，按 n 缓存）。
+        self._logo_photo = None
+        self._logo_cache = {}
+        try:
+            self._logo_photo = tk.PhotoImage(file=resource_path(
+                os.path.join("assets", "app_icon_288.png")))
+        except Exception:
+            self._logo_photo = None  # 资源缺失时回退到自绘金色方块
 
         def _paint_header(_e=None):
             if not hd.winfo_exists():
@@ -581,15 +591,27 @@ class App:
                 return
             K.rr(hd, 0, 0, w, h, 0, sk.header)
             gx, gy, gs = K.u(18), K.u(12), K.u(36)
-            K.rr(hd, gx, gy, gx + gs, gy + gs, K.u(8), sk.gold)
-            for i, t in enumerate((0.36, 0.50, 0.64)):
-                hd.create_line(gx + gs * 0.26, gy + gs * t,
-                               gx + gs * (0.74 if i < 2 else 0.58), gy + gs * t,
-                               fill=sk.header, width=K.u(2), capstyle="round")
+            if self._logo_photo is not None:
+                # 288px 源图按 DPI 抽样到最接近 gs 的档位（整数倍 subsample）
+                n = max(1, min(12, round(288.0 / max(gs, 1))))
+                photo = self._logo_cache.get(n)
+                if photo is None:
+                    try:
+                        photo = self._logo_photo.subsample(n, n)
+                    except Exception:
+                        photo = self._logo_photo
+                    self._logo_cache[n] = photo
+                hd.create_image(gx + gs / 2.0, gy + gs / 2.0, image=photo)
+            else:
+                K.rr(hd, gx, gy, gx + gs, gy + gs, K.u(8), sk.gold)
+                for i, t in enumerate((0.36, 0.50, 0.64)):
+                    hd.create_line(gx + gs * 0.26, gy + gs * t,
+                                   gx + gs * (0.74 if i < 2 else 0.58), gy + gs * t,
+                                   fill=sk.header, width=K.u(2), capstyle="round")
             hd.create_text(gx + gs + K.u(14), h / 2, text="法院文书下载器",
                            font=K.f(14, True), fill="#FFFFFF", anchor="w")
             hd.create_text(w - K.u(18), h / 2,
-                           text="全国法院统一送达平台 · v" + VERSION,
+                           text="法院文书下载器 v" + VERSION,
                            font=K.f(9), fill=sk.header_text_dim, anchor="e")
         hd.bind("<Configure>", _paint_header)
 
