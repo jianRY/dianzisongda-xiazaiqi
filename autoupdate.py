@@ -643,6 +643,15 @@ def windows_replace_and_restart(new_exe_path, log_fn=None):
 
 
 # ---------------- 窗口居中工具 ----------------
+def _u(master, v):
+    """子窗口尺寸过 DPI 缩放（主窗口开了 PER_MONITOR_DPI_AWARE 后，
+    geometry() 收的是物理像素，而字号按 DPI 自动放大 → 不缩放会把子窗口压成窄条）。"""
+    try:
+        return int(round(v * master.winfo_fpixels("1i") / 96.0))
+    except Exception:
+        return int(v)
+
+
 def _center_on(master, w, h):
     """相对 master 居中；master 尺寸还没算出来时退化为屏幕居中，避免弹窗跑到屏幕角落。"""
     try:
@@ -723,7 +732,7 @@ class UpdateDialog(tk.Toplevel):
                  download_urls=None, sha256="", html_url=""):
         super().__init__(master)
         self.title("发现新版本 · %s" % app_name)
-        self.configure(bg="#f4f6f8")
+        self.configure(bg="#F2F4F8")
         self.resizable(False, True)
         try:
             self.transient(master)
@@ -745,13 +754,13 @@ class UpdateDialog(tk.Toplevel):
 
         ttk.Label(
             frm, text="发现新版本 %s（当前 v%s）" % (tag, current_version),
-            font=("Microsoft YaHei", 12, "bold"),
+            font=("Microsoft YaHei UI", 12, "bold"),
         ).pack(anchor="w", pady=(0, 8))
 
         if notes.strip():
-            ttk.Label(frm, text="本次更新内容：", font=("Microsoft YaHei", 10)).pack(anchor="w")
+            ttk.Label(frm, text="本次更新内容：", font=("Microsoft YaHei UI", 10)).pack(anchor="w")
             txt = scrolledtext.ScrolledText(
-                frm, height=12, wrap="word", font=("Microsoft YaHei", 10),
+                frm, height=12, wrap="word", font=("Microsoft YaHei UI", 10),
                 bg="white", relief="flat",
             )
             txt.pack(fill="both", expand=True, pady=(4, 10))
@@ -765,10 +774,10 @@ class UpdateDialog(tk.Toplevel):
         def _mkbtn(parent, text, cmd, primary=False):
             return tk.Button(
                 parent, text=text, command=cmd,
-                font=("Microsoft YaHei", 10, "bold") if primary else ("Microsoft YaHei", 10),
-                bg="#2563eb" if primary else "#e5e7eb",
+                font=("Microsoft YaHei UI", 10, "bold") if primary else ("Microsoft YaHei UI", 10),
+                bg="#2E5DA8" if primary else "#e5e7eb",
                 fg="#ffffff" if primary else "#1f2937",
-                activebackground="#1d4ed8" if primary else "#d1d5db",
+                activebackground="#254C8C" if primary else "#d1d5db",
                 activeforeground="#ffffff" if primary else "#1f2937",
                 relief="flat", bd=0, cursor="hand2",
                 padx=18 if primary else 14, pady=6,
@@ -780,7 +789,7 @@ class UpdateDialog(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self._on_skip)
         self.update_idletasks()
-        w, h = 560, max(340, self.winfo_reqheight())
+        w, h = _u(master, 560), max(_u(master, 340), self.winfo_reqheight())
         x, y = _center_on(master, w, h)
         self.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
@@ -834,7 +843,7 @@ class DownloadProgressDialog(tk.Toplevel):
                  download_urls=None, sha256=""):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
-        self.configure(bg="#f4f6f8")
+        self.configure(bg="#F2F4F8")
         self.resizable(False, False)
         try:
             self.transient(master)
@@ -858,7 +867,7 @@ class DownloadProgressDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=(18, 16))
         frm.pack(fill="both", expand=True)
 
-        self.lbl_title = ttk.Label(frm, text="正在下载新版本…", font=("Microsoft YaHei", 11, "bold"))
+        self.lbl_title = ttk.Label(frm, text="正在下载新版本…", font=("Microsoft YaHei UI", 11, "bold"))
         self.lbl_title.pack(anchor="w", pady=(0, 8))
 
         self.bar = ttk.Progressbar(frm, orient="horizontal", mode="determinate", length=100)
@@ -866,25 +875,25 @@ class DownloadProgressDialog(tk.Toplevel):
         self.bar["maximum"] = 1
         self.bar["value"] = 0
 
-        self.lbl_info = ttk.Label(frm, text="准备中…", font=("Microsoft YaHei", 10))
+        self.lbl_info = ttk.Label(frm, text="准备中…", font=("Microsoft YaHei UI", 10))
         self.lbl_info.pack(anchor="w", pady=(8, 0))
-        self.lbl_speed = ttk.Label(frm, text="速度：—", font=("Microsoft YaHei", 10), foreground="#555")
+        self.lbl_speed = ttk.Label(frm, text="速度：—", font=("Microsoft YaHei UI", 10), foreground="#555")
         self.lbl_speed.pack(anchor="w", pady=(2, 0))
-        self.lbl_src = ttk.Label(frm, text="下载源：正在选择…", font=("Microsoft YaHei", 9),
+        self.lbl_src = ttk.Label(frm, text="下载源：正在选择…", font=("Microsoft YaHei UI", 9),
                                  foreground="#8a94a6")
         self.lbl_src.pack(anchor="w", pady=(2, 10))
 
         tk.Button(frm, text="取消更新", command=self._on_cancel,
-                  font=("Microsoft YaHei", 10),
+                  font=("Microsoft YaHei UI", 10),
                   bg="#e5e7eb", fg="#1f2937",
                   activebackground="#d1d5db", activeforeground="#1f2937",
                   relief="flat", bd=0, cursor="hand2", padx=14, pady=5,
                   ).pack(anchor="e")
 
         self.update_idletasks()
-        w = 460
-        x, y = _center_on(master, w, 210)
-        self.geometry("%dx%d+%d+%d" % (w, 210, x, y))
+        w = _u(master, 460)
+        x, y = _center_on(master, w, _u(master, 210))
+        self.geometry("%dx%d+%d+%d" % (w, _u(master, 210), x, y))
 
         threading.Thread(target=self._worker, daemon=True).start()
         self.after(self.POLL_MS, self._poll)
