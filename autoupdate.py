@@ -36,6 +36,11 @@ autoupdate.py — Tkinter 应用通用自动更新模块（零第三方依赖，
 配置文件约定：
     {"auto_update": true}  缺省视为 true；用户选「以后不再提醒」后写 false。
 
+版本号标准（项目组 2026-09-27 定）：
+    一律**三段式 X.Y.Z**（如 2.9.0），对应 tag v2.9.0。
+    历史两段式 tag（v2.7 / v2.8）依然兼容：parse_version() 统一补零到 3 段再比较，
+    所以「本地 2.8」与「远端 tag v2.8.0」不会互相误判成有新版。
+
 Release 要求：
     - latest Release 的 body 写清楚本次更新内容（markdown 可读即可，弹窗会清理符号）；
     - assets 里放一个 .exe（自动取第一个 .exe 作为下载地址）。
@@ -248,13 +253,27 @@ def rank_sources(urls, timeout=PROBE_TIMEOUT, on_probe_done=None):
 
 
 # ---------------- 版本比较 ----------------
+# 版本号标准：**三段式 X.Y.Z**（项目组 2026-09-27 定，形如 v2.9.0）。
+# 历史 tag 是两段式（v2.7 / v2.8），两种都要认，所以解析时统一补零到 3 段。
+VERSION_PARTS = 3
+
+
 def parse_version(v):
-    """'v1.2.3' / '1.4' → 可比较的数字元组。"""
+    """'v2.9.0' / '2.7' → 可比较的数字元组（不足 3 段补 0）。
+
+    ⚠️ **必须补零**：早期 tag 是两段式（v2.7），新标准是三段式（v2.9.0）。
+    不补零的话 Python 的元组比较会认为 (2,7) < (2,7,0) —— 把「同一个版本」
+    判成「有新版本」，弹出一个永远升不掉的更新提示（本地已是 2.7，
+    远端 tag v2.7.0，点了更新装回来还是 2.7，下次启动继续弹）。
+    补零后 (2,7,0) == (2,7,0)，两端都对得上。
+    """
     v = str(v).strip().lstrip("vV")
     out = []
     for p in re.split(r"[.\-]", v):
         m = re.match(r"\d+", p)
         out.append(int(m.group()) if m else 0)
+    while len(out) < VERSION_PARTS:
+        out.append(0)
     return tuple(out)
 
 

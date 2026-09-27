@@ -58,7 +58,8 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.8"
+# 版本号标准：三段式 X.Y.Z（项目组 2026-09-27 定）。发版脚本 发版脚本 会校验这个格式。
+VERSION = "2.9.0"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"

@@ -5,7 +5,8 @@
 ;        安装包（开始菜单 / 桌面快捷方式 / 系统「已安装的应用」里可卸载）。
 ;
 ;  编译（由 .pybuild_cache\发版脚本 自动调用，也可手动跑）：
-;      ISCC.exe installer.iss /DAppVersion=1.8
+;      ISCC.exe installer.iss /DAppVersion=2.9.0
+;      版本号标准＝三段式 X.Y.Z（项目组 2026-09-27 定）
 ;
 ;  ⚠️ 为什么固定「仅为当前用户安装」（PrivilegesRequired=lowest）：
 ;     程序内置就地自动更新 —— 下载新版后要往「程序所在目录」写文件。
@@ -17,7 +18,7 @@
 ; ============================================================================
 
 #ifndef AppVersion
-  #define AppVersion "1.8"
+  #define AppVersion "2.9.0"
 #endif
 ; 绿色版 exe 的来源路径：由 发版脚本 用 /DSrcExe="..." 传入（带版本号的文件名）。
 ; 默认值仅为手工编译时的兜底。
