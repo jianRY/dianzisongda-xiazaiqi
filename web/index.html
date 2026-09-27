@@ -228,8 +228,11 @@
       document.getElementById('verBadge').innerHTML =
         '最新版本 <b>v' + esc(String(m.version).replace(/^v/,'')) + '</b>';
       var g = document.getElementById('dlGreen'), s = document.getElementById('dlSetup');
-      if(m.url) g.href = m.url;
-      if(m.setup_url) s.href = m.setup_url;
+      /* 优先自有服务器直链：国内快、稳，且与上面「国内直连下载（不经 GitHub）」的说明一致。
+         曾经这里只用了 m.url（GitHub 直链），结果文案说"不经 GitHub"、链接却跳 GitHub，
+         国内用户点下去基本下不动 —— 必须优先 fallback_url。 */
+      if(m.fallback_url || m.url) g.href = m.fallback_url || m.url;
+      if(m.setup_fallback_url || m.setup_url) s.href = m.setup_fallback_url || m.setup_url;
       document.getElementById('dlMeta').textContent =
         'Windows 10/11 · 国内直连下载（不经 GitHub）' +
         (m.size ? ' · 绿色版 ' + fmtMB(m.size) : '') + ' · 均含数字签名';
