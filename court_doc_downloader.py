@@ -88,7 +88,27 @@ def parse_params(text):
 
 
 # ---------- 2. 调接口拿文书清单 ----------
+class LinkRejected(RuntimeError):
+    """法院接口明确拒绝了这条链接（多半是链接已过期）—— 重试无意义。"""
+
+
 def fetch_doc_list(params, ctx):
+    """带重试地取文书清单：网络抖动重试 3 次；「链接过期」不重试，直接报原因。"""
+    last = None
+    for attempt in range(1, 4):
+        try:
+            return _fetch_doc_list_once(params, ctx)
+        except LinkRejected:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < 3:
+                print("  ⚠ 取清单失败（第 %d 次）：%s —— 稍后重试…" % (attempt, e))
+                time.sleep(1.2 * attempt)
+    raise last
+
+
+def _fetch_doc_list_once(params, ctx):
     data = json.dumps(
         {"qdbh": params["qdbh"], "sdbh": params["sdbh"], "sdsin": params["sdsin"]}
     ).encode("utf-8")
@@ -111,12 +131,12 @@ def fetch_doc_list(params, ctx):
         msg = obj.get("msg") or "未知错误"
         # 与图形版一致：把服务端错误翻成人话，最常见的是链接过期导致「校验失败」
         if code == 401 or "校验失败" in str(msg):
-            raise RuntimeError(
+            raise LinkRejected(
                 "接口拒绝了该链接（%s）—— 链接多半已过期，请重新获取送达短信。" % msg)
         raise RuntimeError("接口返回非成功状态（code=%s）：%s" % (code, msg))
     docs = obj.get("data") or []
     if not docs:
-        raise RuntimeError("接口返回文书清单为空（可能链接已失效或参数有误）")
+        raise LinkRejected("接口返回文书清单为空（可能链接已失效或参数有误）")
     return docs
 
 

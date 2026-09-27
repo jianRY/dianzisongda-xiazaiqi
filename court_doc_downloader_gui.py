@@ -30,12 +30,14 @@
 
 import json
 import os
+import queue
 import re
 import ssl
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import ui_kit as K  # 必须最先导入：模块导入时即启用 DPI 感知（先于 tkinter）
 import tkinter as tk
@@ -56,7 +58,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.6"
+VERSION = "2.7"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -67,6 +69,54 @@ GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/r
 APP_ICON_REL = os.path.join("assets", "app.ico")
 # Windows 任务栏身份标识：不设置的话任务栏会显示 python 默认图标
 APP_ID = "jianRY.CourtDocDownloader"
+
+
+# ---------------- 运行日志落盘 ----------------
+# 为什么必须落盘：日志只画在界面上时，一旦界面刷新出问题（或进程被强杀），
+# 用户能看到的就只有「点了没反应」——曾经因此排查了两天。落盘后任何异常都留痕。
+_LOG_LOCK = threading.Lock()
+
+
+def log_dir():
+    """日志目录：%LOCALAPPDATA%\\法院文书下载器\\日志。"""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "法院文书下载器", "日志")
+
+
+def _safe_text(s):
+    """把任意对象转成 Tk 能安全显示的文本。
+
+    Tk 遇到孤立代理字符（surrogate）或 NUL 会直接抛异常 —— 一旦异常发生在
+    「记录错误」这一步，真正的错误信息就会被吞掉（正是 v2.6 以前的坑）。
+    这里统一做清洗，保证日志永远不会因为内容而写不出去。
+    """
+    try:
+        t = str(s).replace("\x00", "")
+        return t.encode("utf-8", "replace").decode("utf-8", "replace")
+    except Exception:
+        return repr(s)
+
+
+def write_log_file(line):
+    """把一行日志追加到当天的日志文件；任何失败都静默（绝不影响主流程）。"""
+    try:
+        d = log_dir()
+        with _LOG_LOCK:
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, "运行日志_%s.log" % time.strftime("%Y%m%d"))
+            # 简单轮转：超过 3MB 就留最后 1MB，避免无限增长
+            try:
+                if os.path.getsize(p) > 3 * 1024 * 1024:
+                    with open(p, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.read()[-1024 * 1024:]
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write("…（日志过大，仅保留最近部分）…\n" + tail)
+            except OSError:
+                pass
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def resource_path(rel):
@@ -207,7 +257,12 @@ def parse_params(text):
     return ts[0] if ts else None
 
 
-def fetch_doc_list(params, ctx):
+class LinkRejected(RuntimeError):
+    """法院接口明确拒绝了这条链接（多半是链接已过期）—— 重试无意义。"""
+
+
+def fetch_doc_list_once(params, ctx):
+    """向法院接口要一次文书清单。网络层异常原样抛出，供上层决定是否重试。"""
     data = json.dumps(
         {"qdbh": params["qdbh"], "sdbh": params["sdbh"], "sdsin": params["sdsin"]}
     ).encode("utf-8")
@@ -231,13 +286,39 @@ def fetch_doc_list(params, ctx):
         # 把服务端错误翻成人话：最常见的就是链接过期导致的「校验失败」，
         # 直接写清楚原因，用户才知道该去重新获取送达短信，而不是以为程序坏了。
         if code == 401 or "校验失败" in str(msg):
-            raise RuntimeError(
+            raise LinkRejected(
                 "接口拒绝了该链接（%s）—— 链接多半已过期，请重新获取送达短信。" % msg)
         raise RuntimeError("接口返回非成功状态（code=%s）：%s" % (code, msg))
     docs = obj.get("data") or []
     if not docs:
-        raise RuntimeError("接口返回文书清单为空（链接可能已失效或参数有误）")
+        raise LinkRejected("接口返回文书清单为空（链接可能已失效或参数有误）")
     return docs
+
+
+def fetch_doc_list(params, ctx, attempts=3, on_retry=None):
+    """带重试地取文书清单。
+
+    ⚠️ 原来这里只请求一次 —— 网络抖一下（DNS 慢、TLS 握手超时、接口偶发 5xx）
+    整条链接就被判死、直接跳过，用户看到的是「点了下载什么都没发生」。
+    现在：网络类错误自动重试 3 次（1.2s / 2.4s 退避）；而接口明确说「链接过期」
+    的（LinkRejected）不重试，立刻把原因报给用户。
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_doc_list_once(params, ctx)
+        except LinkRejected:
+            raise  # 链接本身的问题，重试没用
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < attempts:
+                if on_retry:
+                    try:
+                        on_retry(attempt, e)
+                    except Exception:
+                        pass
+                time.sleep(1.2 * attempt)
+    raise last
 
 
 def download_file(url, path, ctx, cancel_check=None):
@@ -571,6 +652,10 @@ class App:
         self.running = False
         self.stop_event = threading.Event()  # 取消下载信号
         self._cancel_lock = threading.Lock()  # 保护 last_case_dir / 计数等共享状态
+        # ⚠️ 界面更新一律走这条队列，worker 线程绝不直接碰 Tk —— 见 _post / _pump 注释
+        self._ui_queue = queue.Queue()
+        self._pump_job = None
+        self._closing = False
 
         root.title("法院文书下载器 v" + VERSION)
         root.resizable(True, True)
@@ -580,6 +665,9 @@ class App:
         K.style_ttk()
         # 窗口关闭保护：下载中先确认并置取消信号，避免半途强杀留下半成品文件
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 界面回调异常统一落盘：打包成 exe（--windowed）后 sys.stderr 是 None，
+        # Tk 默认的异常打印会二次失败、异常彻底消失 —— 曾因此查了两天的「点了没反应」。
+        root.report_callback_exception = self._report_callback_exception
 
         sk = K.SKIN
         root.configure(bg=sk.bg)
@@ -768,6 +856,58 @@ class App:
         except Exception:
             pass
 
+        # 界面已就绪：启动主线程 UI 泵（worker 的日志/进度都靠它落地）
+        self._pump()
+
+    def _report_callback_exception(self, exc, val, tb):
+        """Tk 回调里的任何未捕获异常都写进日志文件（界面照常继续）。"""
+        try:
+            write_log_file("[界面异常] %s: %s\n%s" % (
+                getattr(exc, "__name__", exc), val,
+                "".join(traceback.format_exception(exc, val, tb))))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- worker 线程与主线程之间的唯一通道 ----
+    def _post(self, fn):
+        """把界面更新排进队列，由主线程的 _pump 执行。
+
+        为什么不能像旧版那样直接 self.root.after(...)：
+          Tkinter 不是线程安全的。worker 线程直接调 root.after 时，只要主线程
+          此刻不在 mainloop 的事件派发状态里，_tkinter 就会抛
+          RuntimeError("main thread is not in main loop")。而旧代码对这个异常的
+          处理是不一致的：log_msg 里 except: pass 把日志静默吞掉；set_bar 里没保护
+          于是直接杀死 worker 线程；连外层 except 里写日志的也是 log_msg（同样被吞）。
+          最终现象就是：点了下载 → 界面卡住不动 → 日志停在半路 → 没有任何报错。
+          改用队列后，worker 只做纯 Python 的 put，永远不可能失败。
+        """
+        try:
+            self._ui_queue.put(fn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _pump(self):
+        """主线程 UI 泵：把 worker 投递的闭包在主线程里执行。"""
+        self._pump_job = None
+        if self._closing:
+            return
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    # 单个回调出错不能拖垮整个泵（否则后续状态复位全丢）
+                    pass
+        except queue.Empty:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._pump_job = self.root.after(40, self._pump)
+        except tk.TclError:
+            self._pump_job = None  # 窗口已销毁
+
     def _settle_after_update(self):
         """更新后首次启动：接管程序文件名 + 清理旧版文件；失败不影响使用。"""
         try:
@@ -775,18 +915,18 @@ class App:
         except Exception:
             pass
 
-    # ---- 线程安全的日志（自动加 [HH:MM:SS] 时间戳）----
+    # ---- 日志（线程安全：队列投递 + 自动加 [HH:MM:SS] + 落盘留痕）----
     def log_msg(self, msg):
-        # 窗口可能已被销毁（用户关窗 / 更新重启），此时 after() 会抛 TclError；
-        # 下载线程仍在收尾，不能让它带着异常退出。
-        try:
-            self.root.after(0, self._log_msg, msg)
-        except Exception:
-            pass
+        """任何线程都能安全调用：只做队列投递，永不抛异常。"""
+        self._post(lambda m=msg: self._log_msg(m))
 
     def _log_msg(self, msg):
-        ts = datetime.now().strftime("[%H:%M:%S] ")
-        self.logview.append(ts + msg)  # LogView 按内容自动分级着色
+        line = datetime.now().strftime("[%H:%M:%S] ") + _safe_text(msg)
+        write_log_file(line)  # 先落盘：即使界面刷新出问题，日志也不丢
+        try:
+            self.logview.append(line)  # LogView 按内容自动分级着色
+        except Exception:  # noqa: BLE001
+            pass
 
     def clear_log(self):
         self.logview.clear()
@@ -843,16 +983,16 @@ class App:
     def _on_jpg_mode_seg(self, key):
         self.jpg_mode_var.set(JPG_MODE_SINGLE if key == "single" else JPG_MODE_PERPDF)
 
-    # ---- 进度条（线程安全）----
+    # ---- 进度条（线程安全：一律走 UI 队列）----
     def reset_bar(self):
-        self.root.after(0, self._reset_bar)
+        self._post(self._reset_bar)
 
     def _reset_bar(self):
         self.progress.set_value(0)
         self.progress_label.configure(text="进度：0 / 0 份 (0%)")
 
     def set_bar(self, total, done):
-        self.root.after(0, self._set_bar, total, done)
+        self._post(lambda t=total, d=done: self._set_bar(t, d))
 
     def _set_bar(self, total, done):
         pct = int(done * 100 / total) if total > 0 else 0
@@ -1162,32 +1302,35 @@ class App:
             self.stop_event.set()
             self.log_msg("⏸ 正在退出，等待当前下载任务收尾…")
             # 给 worker 一点时间清理（最多约 1.5 秒），再关闭窗口
-            self._closing = True
             self.root.after(1500, self._force_close)
             return
-        self.root.destroy()
+        self._force_close()
+
+    def _cancel_pump(self):
+        if self._pump_job is not None:
+            try:
+                self.root.after_cancel(self._pump_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._pump_job = None
 
     def _force_close(self):
+        """真正关窗：先停 UI 泵再销毁窗口，避免销毁后回调乱跑。"""
+        self._closing = True
+        self._cancel_pump()
         try:
             self.root.destroy()
         except tk.TclError:
             pass
 
     def _ui(self, fn):
-        """把回调安全地排到主线程；窗口已销毁时静默丢弃，绝不抛异常。
+        """把界面回调排到主线程执行。
 
-        为什么不能直接 self.root.after：
-          ① 本方法由 worker 线程调用，而 Tkinter 的 Tk 对象**不是线程安全的**，
-             跨线程调 winfo_exists() 这类查询本身就有风险（可能返回假值或抛奇怪异常）；
-          ② 用户点「关闭」后 _force_close 会 destroy 窗口，此时任何 after 都抛 TclError，
-             异常发生在非主线程会打断 worker 的 finally，导致按钮状态/标志位复位不全。
-        所以统一用 try/except TclError 包住 after —— 让「窗口还在不在」由异常来判断，
-        而不是靠跨线程预查询。
+        worker 线程调用它弹提示 / 复位按钮 / 打开文件夹。所有跨线程界面操作统一
+        走 UI 队列 —— 旧版直接 root.after 会遇到「主线程不在 mainloop」而抛
+        RuntimeError，且异常发生在非主线程会打断 worker 收尾。
         """
-        try:
-            self.root.after(0, fn)
-        except (tk.TclError, RuntimeError):
-            pass
+        self._post(fn)
 
     def worker(self, tasks):
         ctx = ssl.create_default_context()
@@ -1197,6 +1340,7 @@ class App:
         total_docs = 0
         cancelled = False
         failed_cases = 0        # 连文书清单都没取到的链接数（链接过期 / 接口报错）
+        last_error = ""         # 最后一次取清单失败的真实原因（报给用户，别再让他猜）
         opened_any_case = False  # each 模式下是否已打开过案件文件夹（失败兜底用）
         # ⚠️ reset_bar 与建目录都必须挡在这层 try 里：reset_bar 是从 worker 线程调
         #    root.after，主线程若不在 mainloop（或窗口已销毁）会抛 RuntimeError/TclError。
@@ -1220,10 +1364,16 @@ class App:
                 self.log_msg("==== 案件 %d / %d ====" % (idx, len(tasks)))
                 self.log_msg("链接：%s" % params.get("url", ""))
                 try:
-                    docs = fetch_doc_list(params, ctx)
+                    # 网络类失败自动重试 3 次；「链接过期」不重试，直接报原因
+                    docs = fetch_doc_list(
+                        params, ctx,
+                        on_retry=lambda n, err: self.log_msg(
+                            "⚠ 取清单失败（第 %d 次尝试）：%s —— 稍后自动重试…"
+                            % (n, _safe_text(err).strip() or type(err).__name__)))
                 except Exception as e:  # noqa: BLE001
                     failed_cases += 1
-                    self.log_msg("✗ 获取清单失败：%s" % e)
+                    last_error = _safe_text(e).strip() or type(e).__name__
+                    self.log_msg("✗ 获取清单失败：%s" % last_error)
                     self.log_msg("   该链接未能取到文书清单，已跳过（链接多半已过期）。")
                     continue
                 self.log_msg("✓ 找到 %d 份文书" % len(docs))
@@ -1369,19 +1519,22 @@ class App:
                 if total_all == 0:
                     # ⚠️ 一份都没拿到时必须报错，绝不能提示「下载完成」——
                     #    旧版正是在这里骗了用户：链接全过期 → 弹「下载完成」→ 桌面空空。
-                    self._ui(lambda n=failed_cases: messagebox.showerror(
+                    #    并且把**真实原因**写进弹窗：光说「详见日志」等于让用户自己猜。
+                    self._ui(lambda n=failed_cases, le=last_error, ld=log_dir():
+                             messagebox.showerror(
                         "未能下载任何文书",
                         "%d 个链接都没有取到文书清单，未下载任何文件。\n\n"
-                        "最常见原因：法院送达短信里的链接已过期或已失效。\n"
-                        "请重新获取送达短信后再试。\n\n"
-                        "如果短信是最新的，请把日志里「✗ 获取清单失败」\n"
-                        "后面那行内容反馈给我继续排查。\n\n详见日志。" % n))
+                        "失败原因：\n%s\n\n"
+                        "· 若提示「链接过期 / 校验失败」→ 请重新获取送达短信后再试\n"
+                        "· 若是网络类错误 → 程序已自动重试 3 次仍失败，请检查网络\n\n"
+                        "完整日志已保存到：\n%s" % (n, le or "（未捕获到具体原因，见日志）", ld)))
                 elif failed_cases or total_ok < total_all:
-                    self._ui(lambda ok=total_ok, al=total_all, fc=failed_cases:
-                             messagebox.showwarning(
+                    self._ui(lambda ok=total_ok, al=total_all, fc=failed_cases,
+                                    le=last_error: messagebox.showwarning(
                                  "部分完成",
-                                 "成功 %d / %d 份文书；另有 %d 个链接未能获取清单。\n\n详见日志。"
-                                 % (ok, al, fc)))
+                                 "成功 %d / %d 份文书；另有 %d 个链接未能获取清单。\n\n"
+                                 "失败原因：%s\n\n详见日志。"
+                                 % (ok, al, fc, le or "见日志")))
                 else:
                     self._ui(lambda n=len(tasks), ok=total_ok: messagebox.showinfo(
                         "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (n, ok)))
@@ -1392,8 +1545,14 @@ class App:
                 elif self.auto_open_mode == AUTO_OPEN_EACH and not opened_any_case:
                     self._ui(self.open_base_folder)
         except Exception as e:  # noqa: BLE001
-            self.log_msg("✗ 出错了：%s" % e)
-            self._ui(lambda: messagebox.showerror("错误", str(e)))
+            # 完整堆栈落盘：worker 出意外时，界面只写一行，但文件里要留全证据
+            try:
+                write_log_file("[TRACEBACK] " + traceback.format_exc().replace("\n", "\n    "))
+            except Exception:  # noqa: BLE001
+                pass
+            self.log_msg("✗ 出错了：%s：%s" % (type(e).__name__, e))
+            self._ui(lambda msg="%s：%s" % (type(e).__name__, e): messagebox.showerror(
+                "错误", msg))
         finally:
             # ⚠️ 收尾动作全部走 _ui()：窗口可能已被用户关掉（_force_close 已 destroy），
             #    此时直接调 self.root.after 会抛 TclError，把 worker 线程弄崩。
@@ -1405,6 +1564,12 @@ class App:
 
 def main():
     setup_app_id()
+    # 每次运行在日志里留下抬头，出问题时一眼能看出是哪次、什么版本、什么环境
+    write_log_file("")
+    write_log_file("=" * 56)
+    write_log_file("启动 法院文书下载器 v%s | Python %s | frozen=%s | 日志目录 %s"
+                   % (VERSION, sys.version.split()[0], bool(getattr(sys, "frozen", False)),
+                      log_dir()))
     root = tk.Tk()
     App(root)
     root.mainloop()
