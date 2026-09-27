@@ -107,7 +107,13 @@ def fetch_doc_list(params, ctx):
         body = resp.read().decode("utf-8")
     obj = json.loads(body)
     if obj.get("code") != 200:
-        raise RuntimeError("接口返回非成功状态：%s" % obj.get("msg"))
+        code = obj.get("code")
+        msg = obj.get("msg") or "未知错误"
+        # 与图形版一致：把服务端错误翻成人话，最常见的是链接过期导致「校验失败」
+        if code == 401 or "校验失败" in str(msg):
+            raise RuntimeError(
+                "接口拒绝了该链接（%s）—— 链接多半已过期，请重新获取送达短信。" % msg)
+        raise RuntimeError("接口返回非成功状态（code=%s）：%s" % (code, msg))
     docs = obj.get("data") or []
     if not docs:
         raise RuntimeError("接口返回文书清单为空（可能链接已失效或参数有误）")

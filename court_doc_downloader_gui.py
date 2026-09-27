@@ -56,7 +56,7 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.5"
+VERSION = "2.6"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -226,7 +226,14 @@ def fetch_doc_list(params, ctx):
         body = resp.read().decode("utf-8")
     obj = json.loads(body)
     if obj.get("code") != 200:
-        raise RuntimeError("接口返回非成功状态：%s" % obj.get("msg"))
+        code = obj.get("code")
+        msg = obj.get("msg") or "未知错误"
+        # 把服务端错误翻成人话：最常见的就是链接过期导致的「校验失败」，
+        # 直接写清楚原因，用户才知道该去重新获取送达短信，而不是以为程序坏了。
+        if code == 401 or "校验失败" in str(msg):
+            raise RuntimeError(
+                "接口拒绝了该链接（%s）—— 链接多半已过期，请重新获取送达短信。" % msg)
+        raise RuntimeError("接口返回非成功状态（code=%s）：%s" % (code, msg))
     docs = obj.get("data") or []
     if not docs:
         raise RuntimeError("接口返回文书清单为空（链接可能已失效或参数有误）")
@@ -459,8 +466,11 @@ def config_path():
 
 
 def load_config():
-    cfg = {"out_dir": "", "auto_open_mode": 0, "convert_jpg": False, "jpg_mode": 0,
-           "auto_update": True, "skip_existing": True}
+    # auto_open_mode 默认 = 打开保存根目录（v2.6 起）。旧默认是「不自动打开」，
+    # 下载完看不到任何反应（尤其下载失败时），用户会以为「点了没下载」。
+    cfg = {"out_dir": "", "auto_open_mode": AUTO_OPEN_ROOT, "convert_jpg": False,
+           "jpg_mode": 0, "auto_update": True, "skip_existing": True,
+           "migrated_open": False}
     try:
         with open(config_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -470,7 +480,14 @@ def load_config():
         if mode in (0, 1, 2):
             cfg["auto_open_mode"] = mode
         elif data.get("auto_open"):  # 兼容旧版布尔配置
-            cfg["auto_open_mode"] = 1
+            cfg["auto_open_mode"] = AUTO_OPEN_ROOT
+        # 一次性迁移（只做一次）：老配置里的「不自动打开」基本都是出厂默认、并非用户主动选择，
+        # v2.6 起统一升级为「打开保存根目录」。迁移后写 migrated_open 标记，此后用户手动改回
+        # 「不打开」会被永久尊重，不会再被覆盖。
+        if not data.get("migrated_open"):
+            if cfg["auto_open_mode"] == AUTO_OPEN_OFF:
+                cfg["auto_open_mode"] = AUTO_OPEN_ROOT
+            cfg["migrated_open"] = True   # 告诉调用方：需要把标记落盘
         cfg["convert_jpg"] = bool(data.get("convert_jpg", False))
         jm = data.get("jpg_mode", None)
         if jm in (0, 1):
@@ -510,6 +527,8 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=None
                 "jpg_mode": int(jpg_mode),
                 "auto_update": bool(auto_update),
                 "skip_existing": bool(skip_existing),
+                # 标记：auto_open_mode 的一次性迁移已执行过，之后用户手选「不打开」不再被覆盖
+                "migrated_open": True,
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -539,10 +558,15 @@ class App:
         self.root = root
         cfg = load_config()
         self.out_dir = cfg["out_dir"] or default_out_dir()
-        self.auto_open_mode = cfg.get("auto_open_mode", 0)
+        self.auto_open_mode = cfg.get("auto_open_mode", AUTO_OPEN_ROOT)
         self.convert_jpg = bool(cfg.get("convert_jpg", False))
         self.jpg_mode = cfg.get("jpg_mode", 0)
         self.skip_existing = bool(cfg.get("skip_existing", True))
+        if cfg.get("migrated_open"):
+            # 老配置的「不自动打开」已一次性升级为「打开保存根目录」，把迁移标记落盘，
+            # 保证只迁移这一次（此后用户手选「不打开」会被永久尊重）。
+            save_config(self.out_dir, self.auto_open_mode, self.convert_jpg,
+                        self.jpg_mode, skip_existing=self.skip_existing)
         self.last_case_dir = None
         self.running = False
         self.stop_event = threading.Event()  # 取消下载信号
@@ -1105,8 +1129,11 @@ class App:
             return
         # 重置取消标志
         self.stop_event.clear()
+        self.btn_start.configure_state(state="normal", text="取消下载", command=self.on_cancel)
+        # ⚠️ running 必须在按钮切换「成功之后」才置 True。反过来写的话，一旦界面操作
+        #    抛异常，running 已经为 True，用户再点按钮会被 `if self.running: return` 挡掉，
+        #    按钮永久卡在「取消下载」——整个程序看起来就是死的。
         self.running = True
-        self.btn_start.configure(state="normal", text="取消下载", command=self.on_cancel)
         self._log_msg("法院文书下载器 v%s" % VERSION)
         self._log_msg("✓ 识别到 %d 个送达链接，将依次下载。" % len(tasks))
         t = threading.Thread(target=self.worker, args=(tasks,), daemon=True)
@@ -1122,7 +1149,7 @@ class App:
         ):
             self.stop_event.set()
             self.log_msg("⏸ 收到取消请求，正在停止剩余任务…")
-            self.btn_start.configure(state="disabled", text="正在取消…")
+            self.btn_start.configure_state(state="disabled", text="正在取消…")
 
     def on_close(self):
         """关闭窗口：下载中先确认，并让 worker 有机会清理半成品文件。"""
@@ -1149,15 +1176,17 @@ class App:
     def _ui(self, fn):
         """把回调安全地排到主线程；窗口已销毁时静默丢弃，绝不抛异常。
 
-        worker 线程在收尾阶段（弹提示、复位按钮、打开文件夹）都要用它：
-        用户点「关闭」后 _force_close 会 destroy 窗口，此时 Tk 对象已失效，
-        任何 self.root.after 都会抛 TclError —— 该异常发生在非主线程，
-        会污染整个 worker 的 finally 块，导致按钮状态/标志位复位不全。
+        为什么不能直接 self.root.after：
+          ① 本方法由 worker 线程调用，而 Tkinter 的 Tk 对象**不是线程安全的**，
+             跨线程调 winfo_exists() 这类查询本身就有风险（可能返回假值或抛奇怪异常）；
+          ② 用户点「关闭」后 _force_close 会 destroy 窗口，此时任何 after 都抛 TclError，
+             异常发生在非主线程会打断 worker 的 finally，导致按钮状态/标志位复位不全。
+        所以统一用 try/except TclError 包住 after —— 让「窗口还在不在」由异常来判断，
+        而不是靠跨线程预查询。
         """
         try:
-            if self.root.winfo_exists():
-                self.root.after(0, fn)
-        except Exception:  # noqa: BLE001
+            self.root.after(0, fn)
+        except (tk.TclError, RuntimeError):
             pass
 
     def worker(self, tasks):
@@ -1167,7 +1196,19 @@ class App:
         done_count = 0
         total_docs = 0
         cancelled = False
-        self.reset_bar()
+        failed_cases = 0        # 连文书清单都没取到的链接数（链接过期 / 接口报错）
+        opened_any_case = False  # each 模式下是否已打开过案件文件夹（失败兜底用）
+        # ⚠️ reset_bar 与建目录都必须挡在这层 try 里：reset_bar 是从 worker 线程调
+        #    root.after，主线程若不在 mainloop（或窗口已销毁）会抛 RuntimeError/TclError。
+        #    若放在下面那个主 try 之外，异常会让 worker 线程**静默死亡**、running 永远
+        #    停在 True、按钮卡在「取消下载」——用户看到的就是「点了下载没反应」。
+        try:
+            self.reset_bar()
+            # 先把保存根目录建出来：即使所有链接都失效，点下载后也能看到文件夹（并按设置打开），
+            # 不会出现「点了没反应、桌面什么都没有」的困惑。
+            os.makedirs(self.out_dir or default_out_dir(), exist_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             for idx, params in enumerate(tasks, 1):
                 # 进入下一个案件前先看取消
@@ -1181,7 +1222,9 @@ class App:
                 try:
                     docs = fetch_doc_list(params, ctx)
                 except Exception as e:  # noqa: BLE001
+                    failed_cases += 1
                     self.log_msg("✗ 获取清单失败：%s" % e)
+                    self.log_msg("   该链接未能取到文书清单，已跳过（链接多半已过期）。")
                     continue
                 self.log_msg("✓ 找到 %d 份文书" % len(docs))
                 total_docs += len(docs)
@@ -1307,6 +1350,7 @@ class App:
                 # 模式：打开每个案件文件夹
                 if self.auto_open_mode == AUTO_OPEN_EACH and not cancelled:
                     _open_in_explorer(case_dir, self.log_msg)
+                    opened_any_case = True
 
                 if cancelled:
                     break
@@ -1315,20 +1359,38 @@ class App:
             if cancelled:
                 self.log_msg("")
                 self.log_msg("=== 已取消：成功 %d / %d 份 ===" % (total_ok, max(total_all, done_count)))
-                self._ui(lambda: messagebox.showinfo(
-                    "已取消", "下载已取消。成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
+                # 闭包用默认参数绑定数值：_ui 是延迟执行，直接引用外层变量会读到后续变化
+                self._ui(lambda ok=total_ok, al=total_all: messagebox.showinfo(
+                    "已取消", "下载已取消。成功 %d / %d 份，详见日志。" % (ok, al)))
             else:
                 self.log_msg("")
-                self.log_msg("=== 全部完成：成功 %d / %d 份（%d 个案件）===" % (total_ok, total_all, len(tasks)))
-                if total_ok < total_all:
-                    self._ui(lambda: messagebox.showwarning(
-                        "部分失败", "成功 %d / %d 份，详见日志。" % (total_ok, total_all)))
+                self.log_msg("=== 全部完成：成功 %d / %d 份（共 %d 个链接，%d 个未取到清单）==="
+                             % (total_ok, total_all, len(tasks), failed_cases))
+                if total_all == 0:
+                    # ⚠️ 一份都没拿到时必须报错，绝不能提示「下载完成」——
+                    #    旧版正是在这里骗了用户：链接全过期 → 弹「下载完成」→ 桌面空空。
+                    self._ui(lambda n=failed_cases: messagebox.showerror(
+                        "未能下载任何文书",
+                        "%d 个链接都没有取到文书清单，未下载任何文件。\n\n"
+                        "最常见原因：法院送达短信里的链接已过期或已失效。\n"
+                        "请重新获取送达短信后再试。\n\n"
+                        "如果短信是最新的，请把日志里「✗ 获取清单失败」\n"
+                        "后面那行内容反馈给我继续排查。\n\n详见日志。" % n))
+                elif failed_cases or total_ok < total_all:
+                    self._ui(lambda ok=total_ok, al=total_all, fc=failed_cases:
+                             messagebox.showwarning(
+                                 "部分完成",
+                                 "成功 %d / %d 份文书；另有 %d 个链接未能获取清单。\n\n详见日志。"
+                                 % (ok, al, fc)))
                 else:
-                    self._ui(lambda: messagebox.showinfo(
-                        "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (len(tasks), total_ok)))
-                # 模式：打开保存根目录（批量时可见所有案件子文件夹）
-                if self.auto_open_mode == AUTO_OPEN_ROOT and self.out_dir and os.path.isdir(self.out_dir):
-                    self.root.after(50, self.open_base_folder)
+                    self._ui(lambda n=len(tasks), ok=total_ok: messagebox.showinfo(
+                        "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (n, ok)))
+                # 自动打开保存位置：一个案件文件夹都没建起来时（链接全失效），
+                # 也要按设置打开根目录，否则用户看到的是「点了下载毫无反应」。
+                if self.auto_open_mode == AUTO_OPEN_ROOT:
+                    self._ui(self.open_base_folder)
+                elif self.auto_open_mode == AUTO_OPEN_EACH and not opened_any_case:
+                    self._ui(self.open_base_folder)
         except Exception as e:  # noqa: BLE001
             self.log_msg("✗ 出错了：%s" % e)
             self._ui(lambda: messagebox.showerror("错误", str(e)))
@@ -1337,7 +1399,7 @@ class App:
             #    此时直接调 self.root.after 会抛 TclError，把 worker 线程弄崩。
             self.running = False
             self.stop_event.clear()
-            self._ui(lambda: self.btn_start.configure(
+            self._ui(lambda: self.btn_start.configure_state(
                 state="normal", text="开始下载", command=self.on_start))
 
 
