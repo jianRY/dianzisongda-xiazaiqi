@@ -16,6 +16,8 @@ autoupdate.py — Tkinter 应用通用自动更新模块（零第三方依赖，
        **命名规则**：绿色版更新后改名成「app_name_v实际版本号.exe」，让文件名与版本永远一致；
        安装版保持固定名「app_name.exe」不变（快捷方式/卸载/下一次更新都认它）。
        → 见 desired_base_name() + settle_after_update(app_name=..., version=...)
+       ⚠️ 改名**推迟到进程退出时**执行（atexit）：实测在运行期间改自己的名字会让本进程
+       出网永久失效（一点下载就卡死、必须关掉重开）—— 详见 _PENDING_RENAME 段。
     4. 菜单/按钮手动「检查更新」不受 auto_update 开关影响（manual=True）
 
 接入方法（三行代码）：
@@ -46,6 +48,7 @@ Release 要求：
     - assets 里放一个 .exe（自动取第一个 .exe 作为下载地址）。
 """
 
+import atexit
 import hashlib
 import json
 import os
@@ -492,7 +495,12 @@ def _old_version_pattern_multi(prefixes, ext):
     为什么需要多个前缀：更新后文件名会带上实际版本号（法院文书下载器_v2.5.exe
     → 法院文书下载器_v2.7.exe），所以「自己产生的残留」不再只有一个基准名。
     把 app_name、更新前的基准名、更新后的基准名都列进来，既能覆盖全部残留，
-    又因为要求 `前缀 + _旧版/_更新中 + 扩展名` 精确结构，不会误删同目录其他文件。
+    又因为要求 `前缀 + 可选_v版本 + _旧版/_更新中 + 扩展名` 精确结构，
+    不会误删同目录其他文件。
+
+    为什么前缀后面允许再跟一段 `_v数字.数字`：老版本留下的中间名是
+    `法院文书下载器_v2.8_更新中.exe`（前缀只认到 `法院文书下载器`），
+    不放宽的话这种历史残留永远清不掉。
     """
     uniq = []
     for p in prefixes:
@@ -502,7 +510,7 @@ def _old_version_pattern_multi(prefixes, ext):
         return re.compile(r"(?!x)x")        # 永不匹配
     alts = "|".join(re.escape(p) for p in uniq)
     return re.compile(
-        r"^(?:%s)_(?:旧版(?:_\d+)?|更新中(?:_\d+)?)%s$" % (alts, re.escape(ext)),
+        r"^(?:%s)(?:_v[\d.]+)?_(?:旧版(?:_\d+)?|更新中(?:_\d+)?)%s$" % (alts, re.escape(ext)),
         re.IGNORECASE,
     )
 
@@ -597,22 +605,100 @@ def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None):
     return removed
 
 
+# ---------------------------------------------------------------- 待改名登记
+# ⚠️⚠️ 2026-09-27 实测铁律（复现脚本 .pybuild_cache/_diag/probe_matrix.py）：
+#   **把正在运行的 exe 改名，会让本进程的出网永久失效。**
+#     直接启动 + 正常文件名        → 4.0 秒拿到版本信息
+#     直接启动 + `_更新中` 文件名  → 75 秒仍然一个字节都发不出去
+#     父进程 startfile + 正常文件名 → 4.3 秒
+#     父进程 startfile + `_更新中`（真实更新路径）→ 75 秒仍然出不去
+#   结论：与「谁启动的」无关，只要进程改了自己的名字，网络就废掉且不会自行恢复。
+#   用户看到的症状：更新完自动打开的新版，一点下载就莫名卡死，必须关掉重开。
+# 所以：**绝不在运行期间改名**，只登记待办，等进程退出时（已不需要网络）再改。
+_PENDING_RENAME = None
+_RENAME_HOOKED = False
+# atexit 里能拿到的日志回调（注册时的那个）
+_PENDING_LOG_FN = None
+
+
+def _park_file(directory, path, ext):
+    """把 path 挪成 `xxx_旧版_<时间戳>.exe`，返回是否成功。
+
+    两条 Windows 硬事实决定了必须用「挪开」而不是「删除」：
+      · 运行中的 exe **不能删、不能覆盖**，但**可以改名**（同目录改名不受锁限制）
+      · 若沿用固定名（xxx_旧版.exe），一旦上次更新留下同名残留，os.rename
+        会因「目标已存在」直接失败 → 接管失败 → 用户继续启动旧版本
+        （症状就是「更新了却没变」）。带时间戳 + 冲突兜底可彻底避免。
+    """
+    try:
+        pstem = os.path.splitext(os.path.basename(path))[0]
+        parked = os.path.join(
+            directory, "%s_旧版_%s%s" % (pstem, time.strftime("%Y%m%d%H%M%S"), ext))
+        if os.path.exists(parked):
+            try:
+                os.remove(parked)          # 自己上次的残留，能删就复用这个名字
+            except OSError:
+                parked = os.path.join(
+                    directory, "%s_旧版_%d%s" % (pstem, int(time.time() * 1000), ext))
+        os.rename(path, parked)
+        return True
+    except OSError:
+        return False
+
+
+def apply_pending_rename(log_fn=None):
+    """进程退出时把程序文件名改成「软件名_v实际版本号」（由 atexit 自动调用）。
+
+    放在退出时做，是为了绕开上面那条铁律：此时网络已经不需要了，改名无副作用。
+    幂等且绝不抛异常 —— 它跑在解释器关闭阶段，出错也不能影响退出。
+    """
+    p = _PENDING_RENAME
+    if not p:
+        return False
+    log_fn = log_fn or _PENDING_LOG_FN
+
+    def _log(m):
+        try:
+            if log_fn:
+                log_fn(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        current, final = p["current"], p["final"]
+        if not os.path.exists(current):
+            return False                       # 已经被改过 / 文件没了
+        if os.path.abspath(current).lower() == os.path.abspath(final).lower():
+            return False
+        if os.path.exists(final):
+            # 目标名已被占用（又更新过一次、或用户自己放了个同名文件）→ 不动手，绝不覆盖
+            _log("退出时未改名：%s 已存在，留给下次启动处理"
+                 % os.path.basename(final))
+            return False
+        os.rename(current, final)
+        _log("已把程序文件名改为：%s" % os.path.basename(final))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def settle_after_update(log_fn=None, app_name=None, version=None):
-    """程序启动时调用：接管程序文件名（带上实际版本号）并清掉更新留下的旧版文件。
+    """程序启动时调用：登记「退出时要改的文件名」，并清掉更新留下的旧版文件。
 
-    只在打包运行时生效。所谓「接管」：如果自己是以中间名（xxx_更新中.exe）
-    启动的，就把旧的 xxx.exe 挪开、把自己改成**该有的名字**。
+    ⚠️ **本函数不再在启动时改名**（原因见上方 `_PENDING_RENAME` 段的实测铁律）。
+    它只做两件事：① 把该腾的位置腾开、把上一版文件挪走；② 登记待改名，退出时执行。
 
-    更新后叫什么，由 desired_base_name() 决定：
+    更新后该叫什么，由 desired_base_name() 决定：
       · 安装版（光名字 `法院文书下载器.exe`）→ 保持固定名，快捷方式与卸载才不会断
-      · 绿色版 → 改成 `法院文书下载器_v<当前版本>.exe`，名字与实际版本永远一致
-    该规则是幂等的：名字已经对了就什么都不做，所以每次启动调用都安全。
+      · 绿色版 → `法院文书下载器_v<当前版本>.exe`，名字与实际版本永远一致
+    规则幂等：名字已经对了就什么都不做，所以每次启动调用都安全。
 
     为什么新版要先用中间名启动，而不是直接顶替原文件名：
         实测（Windows 10/11 + PyInstaller onefile）**无法在「当前运行进程自己的
         映像路径」上启动新进程** —— 引导器进程起得来，但真实程序起不来，
         表现为「程序关了却没有新窗口」。换个名字或换个目录都能正常启动。
     """
+    global _PENDING_RENAME, _RENAME_HOOKED, _PENDING_LOG_FN
     if not _is_frozen():
         return []
     try:
@@ -633,49 +719,29 @@ def settle_after_update(log_fn=None, app_name=None, version=None):
     target = desired_base_name(app_name, version, base)   # 更新后该有的名字
     final = os.path.join(directory, target + ext)
 
-    def _park(path):
-        """把 path 挪成 `xxx_旧版_<时间戳>.exe`。
-
-        两条 Windows 硬事实决定了必须用「挪开」而不是「删除」：
-          · 运行中的 exe **不能删、不能覆盖**，但**可以改名**（同目录改名不受锁限制）
-          · 若沿用固定名（xxx_旧版.exe），一旦上次更新留下同名残留，os.rename
-            会因「目标已存在」直接失败 → 接管失败 → 用户继续启动旧版本
-            （症状就是「更新了却没变」）。带时间戳 + 冲突兜底可彻底避免。
-        """
-        pstem = os.path.splitext(os.path.basename(path))[0]
-        parked = os.path.join(
-            directory, "%s_旧版_%s%s" % (pstem, time.strftime("%Y%m%d%H%M%S"), ext))
-        if os.path.exists(parked):
-            try:
-                os.remove(parked)          # 自己上次的残留，能删就复用这个名字
-            except OSError:
-                parked = os.path.join(
-                    directory, "%s_旧版_%d%s" % (pstem, int(time.time() * 1000), ext))
-        try:
-            os.rename(path, parked)
-            return True
-        except OSError:
-            return False
-
-    # ① 接管文件名：自己叫中间名、或名字已过时（没带当前版本号）时，换上正确的名字
+    # ① 名字不对时：腾位置 + 登记待改名（**不在这里动手**）
     if os.path.abspath(current).lower() != os.path.abspath(final).lower():
         # (a) 目标名字已被占（比如上次更新留下的残留）→ 先挪开腾位置
         if os.path.exists(final):
-            _park(final)
-        # (b) 旧版本（上一个进程实际在跑的那个文件）也挪开。
+            _park_file(directory, final, ext)
+        # (b) 上一版实际在跑的那个文件（base.exe）也挪开。
         #     ⚠️ 改名之后「新名字」不再等于「旧名字」，所以不能再指望 (a) 顺带把它处理掉；
         #     必须显式把 base.exe 挪走，否则新旧两个 exe 会并排留在目录里，用户不知道该点哪个。
         old_final = os.path.join(directory, base + ext)
         if (os.path.abspath(old_final).lower() != os.path.abspath(current).lower()
                 and os.path.exists(old_final)):
-            _park(old_final)
-        # (c) 自己顶上
-        try:
-            os.rename(current, final)
-            _log("已接管程序文件名：%s → %s"
-                 % (os.path.basename(current), os.path.basename(final)))
-        except OSError as e:  # noqa: BLE001
-            _log("暂未能接管文件名（旧版本可能仍在运行）：%s" % e)
+            _park_file(directory, old_final, ext)
+        # (c) 登记：退出时把 current 改成 final
+        _PENDING_RENAME = {"current": current, "final": final}
+        _PENDING_LOG_FN = log_fn
+        if not _RENAME_HOOKED:
+            try:
+                atexit.register(apply_pending_rename)
+                _RENAME_HOOKED = True
+            except Exception:  # noqa: BLE001
+                pass
+        _log("程序文件名将在退出时改为：%s（本次运行不受影响）"
+             % os.path.basename(final))
 
     # ② 清掉所有旧版/中间残留（含刚被挪开的那份，旧进程退出后即可删除）
     prefixes = [base, target]

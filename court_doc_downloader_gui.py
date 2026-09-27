@@ -59,7 +59,7 @@ REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
 # 版本号标准：三段式 X.Y.Z（项目组 2026-09-27 定）。发版脚本 发版脚本 会校验这个格式。
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -913,16 +913,19 @@ class App:
             self._pump_job = None  # 窗口已销毁
 
     def _settle_after_update(self):
-        """更新后首次启动：把文件名改成「软件名_v实际版本号」+ 清理旧版文件。
+        """更新后首次启动：登记「退出时把文件改成软件名_v实际版本号」+ 清理旧版文件。
 
-        传入 app_name / version 后，绿色版会从旧名字（如 v2.5）改名成当前版本
-        （v2.7），彻底避免「文件名叫 v2.1、跑的其实是 v2.7」这种串版；
-        安装版因为文件名就是光名字，会被识别出来并保持固定名不变（快捷方式不能断）。
-        名字已正确时该函数什么都不做，所以每次启动调用都安全。失败不影响使用。
+        ⚠️ **启动时故意不改名**：实测把正在运行的 exe 改名会让本进程**出网永久失效**
+        （连 DNS 都出不去，之前 v2.8/v2.9.0 的「更新完自动打开的新版一点下载就卡死、
+        必须关掉重开」就是这个原因）。改名推迟到退出时由 autoupdate 的 atexit 钩子执行。
+
+        传入 app_name / version 后，绿色版退出时会把旧名字（如 v2.9.0）改成当前版本
+        （v2.10.0）；安装版因为文件名就是光名字，会被识别出来并保持固定名不变
+        （快捷方式/卸载都认它，不能改）。名字已正确时该函数什么都不做。
         """
         try:
             autoupdate.settle_after_update(
-                log_fn=self.log_msg, app_name=APP_NAME, version=VERSION)
+                log_fn=self._settle_log, app_name=APP_NAME, version=VERSION)
         except Exception:
             pass
 
@@ -934,10 +937,24 @@ class App:
     def _log_msg(self, msg):
         line = datetime.now().strftime("[%H:%M:%S] ") + _safe_text(msg)
         write_log_file(line)  # 先落盘：即使界面刷新出问题，日志也不丢
+        self._append_log(line)
+
+    def _append_log(self, line):
         try:
             self.logview.append(line)  # LogView 按内容自动分级着色
         except Exception:  # noqa: BLE001
             pass
+
+    def _settle_log(self, msg):
+        """更新/改名相关日志：**先直接落盘**再投界面。
+
+        为什么不用 log_msg：改名推迟到进程退出时执行（autoupdate 的 atexit 钩子），
+        那一刻主线程的界面泵已经停了 —— 走 log_msg 的话这条记录只会进队列、
+        永远不会被执行，日志里就看不到「文件名改成了什么」。落盘才是可靠留痕。
+        """
+        line = datetime.now().strftime("[%H:%M:%S] ") + _safe_text(msg)
+        write_log_file(line)
+        self._post(lambda l=line: self._append_log(l))
 
     def clear_log(self):
         self.logview.clear()
@@ -1374,6 +1391,9 @@ class App:
                 self.log_msg("")
                 self.log_msg("==== 案件 %d / %d ====" % (idx, len(tasks)))
                 self.log_msg("链接：%s" % params.get("url", ""))
+                # 取清单要联网，慢的时候界面会有几秒没动静；先给一行可见反馈，
+                # 免得用户以为卡死了（v2.10.0 起）。正常情况这条几乎瞬间就被下一行顶掉。
+                self.log_msg("⏳ 正在连接法院平台获取文书清单…")
                 try:
                     # 网络类失败自动重试 3 次；「链接过期」不重试，直接报原因
                     docs = fetch_doc_list(
