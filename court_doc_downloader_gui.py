@@ -58,7 +58,10 @@ BROWSER_UA = (
 REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
-VERSION = "2.7"
+VERSION = "2.8"
+# 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
+# （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
+APP_NAME = "法院文书下载器"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
@@ -909,9 +912,16 @@ class App:
             self._pump_job = None  # 窗口已销毁
 
     def _settle_after_update(self):
-        """更新后首次启动：接管程序文件名 + 清理旧版文件；失败不影响使用。"""
+        """更新后首次启动：把文件名改成「软件名_v实际版本号」+ 清理旧版文件。
+
+        传入 app_name / version 后，绿色版会从旧名字（如 v2.5）改名成当前版本
+        （v2.7），彻底避免「文件名叫 v2.1、跑的其实是 v2.7」这种串版；
+        安装版因为文件名就是光名字，会被识别出来并保持固定名不变（快捷方式不能断）。
+        名字已正确时该函数什么都不做，所以每次启动调用都安全。失败不影响使用。
+        """
         try:
-            autoupdate.settle_after_update(log_fn=self.log_msg)
+            autoupdate.settle_after_update(
+                log_fn=self.log_msg, app_name=APP_NAME, version=VERSION)
         except Exception:
             pass
 
@@ -1195,7 +1205,7 @@ class App:
         """菜单/按钮手动检查：不受「以后不再提醒」开关影响。"""
         autoupdate.run_update_check(
             self.root,
-            app_name="法院文书下载器",
+            app_name=APP_NAME,
             current_version=VERSION,
             latest_api_url=GITHUB_API_LATEST,
             config_file=config_path(),
@@ -1209,7 +1219,7 @@ class App:
         """启动静默检查：发现新版弹「更新内容 + 三选项」对话框。"""
         autoupdate.run_update_check(
             self.root,
-            app_name="法院文书下载器",
+            app_name=APP_NAME,
             current_version=VERSION,
             latest_api_url=GITHUB_API_LATEST,
             config_file=config_path(),

@@ -11,8 +11,11 @@ autoupdate.py — Tkinter 应用通用自动更新模块（零第三方依赖，
          立即更新     → 下载进度对话框（进度条 / 速度 / 已下载大小 / 随时取消）
          本次忽略     → 本次关闭，下次启动继续检查
          以后不再提醒 → 配置文件写 auto_update=false，启动不再自动检查
-    3. 下载完成 → 新版直接放进程序所在目录并接管原文件名，旧版由新版启动后删除
+    3. 下载完成 → 新版直接放进程序所在目录并接管程序文件名，旧版由新版启动后删除
        （不生成 bat、不做「等进程退出」的轮询，见 windows_replace_and_restart）
+       **命名规则**：绿色版更新后改名成「app_name_v实际版本号.exe」，让文件名与版本永远一致；
+       安装版保持固定名「app_name.exe」不变（快捷方式/卸载/下一次更新都认它）。
+       → 见 desired_base_name() + settle_after_update(app_name=..., version=...)
     4. 菜单/按钮手动「检查更新」不受 auto_update 开关影响（manual=True）
 
 接入方法（三行代码）：
@@ -464,12 +467,62 @@ def _old_version_pattern(base_stem, ext):
     )
 
 
-def cleanup_old_versions(log_fn=None, max_wait=8.0):
+def _old_version_pattern_multi(prefixes, ext):
+    """按「多个可能的前缀」生成旧版/中间文件匹配规则。
+
+    为什么需要多个前缀：更新后文件名会带上实际版本号（法院文书下载器_v2.5.exe
+    → 法院文书下载器_v2.7.exe），所以「自己产生的残留」不再只有一个基准名。
+    把 app_name、更新前的基准名、更新后的基准名都列进来，既能覆盖全部残留，
+    又因为要求 `前缀 + _旧版/_更新中 + 扩展名` 精确结构，不会误删同目录其他文件。
+    """
+    uniq = []
+    for p in prefixes:
+        if p and p not in uniq:
+            uniq.append(p)
+    if not uniq:
+        return re.compile(r"(?!x)x")        # 永不匹配
+    alts = "|".join(re.escape(p) for p in uniq)
+    return re.compile(
+        r"^(?:%s)_(?:旧版(?:_\d+)?|更新中(?:_\d+)?)%s$" % (alts, re.escape(ext)),
+        re.IGNORECASE,
+    )
+
+
+def desired_base_name(app_name, version, fallback):
+    """决定「更新后本程序该叫什么名字」（不含扩展名）。
+
+    项目组 2026-09-27 要求：自动更新后文件名要带上**实际**版本号
+    （`法院文书下载器_v2.7.exe`），别再出现「名字写着 v2.1、跑的其实是 v2.7」
+    这种串版 —— 桌面那个假 v2.1 就是这么来的，白查了半天。
+
+    ⚠️ 但**安装版必须保持固定名不变**：开始菜单/桌面的快捷方式、卸载程序、
+    以及后续每一次自动更新，全都认死这个名字（见 installer.iss 的
+    `DestName: "{#AppName}.exe"`）。给安装版改名等于把这三者一起打断。
+
+    判据 = 「当前文件名是不是就叫 app_name 这个光名字」：
+      · 安装版落地名就是 `法院文书下载器.exe` → fallback == app_name → 保持固定名
+      · 绿色版名字带版本号（`法院文书下载器_v2.5.exe`）→ fallback != app_name → 换成新版本号
+    这比探 `unins*.exe` 或查注册表都稳，且绝不会误伤安装版。
+
+    app_name / version 缺失时（其他项目还没接这一步）原样返回 fallback =
+    完全保持旧行为，不影响既有软件。
+    """
+    if not app_name or not version:
+        return fallback
+    if fallback == app_name:            # 光名字 → 安装版（或旧版绿色版）→ 不动
+        return fallback
+    return "%s_v%s" % (app_name, version)
+
+
+def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None):
     """删除程序目录里遗留的「旧版 / 更新中」文件。
 
     只在打包运行时生效；开发态直接返回，不做任何事。
     命中规则严格限定为本程序自己的命名格式，且排除当前正在运行的自己。
     刚启动时旧进程可能还没完全退出（文件仍被锁），所以带重试。
+
+    app_name 传了就用「多前缀」规则（见 _old_version_pattern_multi），
+    以覆盖改名后基准名变化的情况；不传则沿用旧的单前缀规则。
     """
     if not _is_frozen():
         return []
@@ -477,14 +530,21 @@ def cleanup_old_versions(log_fn=None, max_wait=8.0):
         current = os.path.abspath(sys.executable)
     except Exception:  # noqa: BLE001
         return []
+    prefixes = None
+    if app_name:
+        prefixes = [app_name,
+                    _base_stem(os.path.splitext(os.path.basename(current))[0])]
     return _purge(directory=os.path.dirname(current), current=current,
-                  log_fn=log_fn, max_wait=max_wait)
+                  log_fn=log_fn, max_wait=max_wait, prefixes=prefixes)
 
 
-def _purge(directory, current, log_fn=None, max_wait=8.0):
+def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None):
     """删除 directory 下所有「本程序旧版/中间」文件（排除 current）。"""
     stem, ext = os.path.splitext(os.path.basename(current))
-    pat = _old_version_pattern(_base_stem(stem), ext)
+    if prefixes:
+        pat = _old_version_pattern_multi(prefixes, ext)
+    else:
+        pat = _old_version_pattern(_base_stem(stem), ext)
 
     def _scan():
         found = []
@@ -518,11 +578,16 @@ def _purge(directory, current, log_fn=None, max_wait=8.0):
     return removed
 
 
-def settle_after_update(log_fn=None):
-    """程序启动时调用：接管原文件名，并清掉更新过程留下的旧版文件。
+def settle_after_update(log_fn=None, app_name=None, version=None):
+    """程序启动时调用：接管程序文件名（带上实际版本号）并清掉更新留下的旧版文件。
 
     只在打包运行时生效。所谓「接管」：如果自己是以中间名（xxx_更新中.exe）
-    启动的，就把旧的 xxx.exe 挪开、把自己改名为 xxx.exe，让用户看到的文件名始终不变。
+    启动的，就把旧的 xxx.exe 挪开、把自己改成**该有的名字**。
+
+    更新后叫什么，由 desired_base_name() 决定：
+      · 安装版（光名字 `法院文书下载器.exe`）→ 保持固定名，快捷方式与卸载才不会断
+      · 绿色版 → 改成 `法院文书下载器_v<当前版本>.exe`，名字与实际版本永远一致
+    该规则是幂等的：名字已经对了就什么都不做，所以每次启动调用都安全。
 
     为什么新版要先用中间名启动，而不是直接顶替原文件名：
         实测（Windows 10/11 + PyInstaller onefile）**无法在「当前运行进程自己的
@@ -545,32 +610,59 @@ def settle_after_update(log_fn=None):
 
     directory = os.path.dirname(current)
     stem, ext = os.path.splitext(os.path.basename(current))
-    base = _base_stem(stem)
-    final = os.path.join(directory, base + ext)
+    base = _base_stem(stem)                          # 更新前的基准名
+    target = desired_base_name(app_name, version, base)   # 更新后该有的名字
+    final = os.path.join(directory, target + ext)
 
-    # ① 接管文件名：自己叫中间名时，把旧版挪开（运行中的 exe 允许改名），自己顶上
-    if os.path.abspath(current).lower() != os.path.abspath(final).lower():
-        # 旧版名带时间戳：若沿用固定名（xxx_旧版.exe），一旦上次更新留下同名残留，
-        # Windows 的 os.rename 会因「目标已存在」直接失败 → 接管失败 → 用户继续启动
-        # 旧版本（症状就是「更新了却没变」）。带时间戳 + 冲突兜底可彻底避免。
+    def _park(path):
+        """把 path 挪成 `xxx_旧版_<时间戳>.exe`。
+
+        两条 Windows 硬事实决定了必须用「挪开」而不是「删除」：
+          · 运行中的 exe **不能删、不能覆盖**，但**可以改名**（同目录改名不受锁限制）
+          · 若沿用固定名（xxx_旧版.exe），一旦上次更新留下同名残留，os.rename
+            会因「目标已存在」直接失败 → 接管失败 → 用户继续启动旧版本
+            （症状就是「更新了却没变」）。带时间戳 + 冲突兜底可彻底避免。
+        """
+        pstem = os.path.splitext(os.path.basename(path))[0]
         parked = os.path.join(
-            directory, "%s_旧版_%s%s" % (base, time.strftime("%Y%m%d%H%M%S"), ext))
+            directory, "%s_旧版_%s%s" % (pstem, time.strftime("%Y%m%d%H%M%S"), ext))
         if os.path.exists(parked):
             try:
                 os.remove(parked)          # 自己上次的残留，能删就复用这个名字
             except OSError:
                 parked = os.path.join(
-                    directory, "%s_旧版_%d%s" % (base, int(time.time() * 1000), ext))
+                    directory, "%s_旧版_%d%s" % (pstem, int(time.time() * 1000), ext))
         try:
-            if os.path.exists(final):
-                os.rename(final, parked)
+            os.rename(path, parked)
+            return True
+        except OSError:
+            return False
+
+    # ① 接管文件名：自己叫中间名、或名字已过时（没带当前版本号）时，换上正确的名字
+    if os.path.abspath(current).lower() != os.path.abspath(final).lower():
+        # (a) 目标名字已被占（比如上次更新留下的残留）→ 先挪开腾位置
+        if os.path.exists(final):
+            _park(final)
+        # (b) 旧版本（上一个进程实际在跑的那个文件）也挪开。
+        #     ⚠️ 改名之后「新名字」不再等于「旧名字」，所以不能再指望 (a) 顺带把它处理掉；
+        #     必须显式把 base.exe 挪走，否则新旧两个 exe 会并排留在目录里，用户不知道该点哪个。
+        old_final = os.path.join(directory, base + ext)
+        if (os.path.abspath(old_final).lower() != os.path.abspath(current).lower()
+                and os.path.exists(old_final)):
+            _park(old_final)
+        # (c) 自己顶上
+        try:
             os.rename(current, final)
-            _log("已接管程序文件名：%s" % os.path.basename(final))
+            _log("已接管程序文件名：%s → %s"
+                 % (os.path.basename(current), os.path.basename(final)))
         except OSError as e:  # noqa: BLE001
             _log("暂未能接管文件名（旧版本可能仍在运行）：%s" % e)
 
     # ② 清掉所有旧版/中间残留（含刚被挪开的那份，旧进程退出后即可删除）
-    return _purge(directory, current, log_fn=log_fn, max_wait=12.0)
+    prefixes = [base, target]
+    if app_name:
+        prefixes.insert(0, app_name)
+    return _purge(directory, current, log_fn=log_fn, max_wait=12.0, prefixes=prefixes)
 
 
 def windows_replace_and_restart(new_exe_path, log_fn=None):
