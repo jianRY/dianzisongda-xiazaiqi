@@ -112,7 +112,7 @@
           安装版下载
         </a>
       </div>
-      <p class="dl-meta" id="dlMeta">Windows 10/11 · 双版本均含数字签名 · 国内直连下载 download.internal:8888</p>
+      <p class="dl-meta" id="dlMeta">Windows 10/11 · 双版本均含数字签名 · 国内直连下载 · 无需科学上网</p>
     </div>
   </div>
 </header>
@@ -189,7 +189,10 @@
   var API = 'https://api.github.com/repos/' + REPO + '/releases?per_page=5';
   /* 自有下载站的更新元数据（国内直连，快）。服务器脚本从 Release 抄过来，
      含版本号 / 更新说明 / 服务器直链 / GitHub 兜底直链。取到就优先用它。 */
-  var SERVER_META = 'http://download.internal:8888/updates/court.json';
+  /* ⚠️ 用「同站相对路径」而不是写死地址：官网本身部署在下载站上，
+     相对路径会自动解析到同一站点的 /updates/court.json（源码里因此不含源站地址）。
+     若页面被放到别处（如 GitHub Pages），这里会 404，下面的 GitHub API 兜底照常生效。 */
+  var SERVER_META = 'updates/court.json';
   var serverOK = false;
   /* GitHub 加速镜像（2026-09-22）：浏览器直接点 GitHub 直链，在国内基本下不动；
      而自有服务器元数据又可能取不到（跨域被拦 / 服务器尚未同步），

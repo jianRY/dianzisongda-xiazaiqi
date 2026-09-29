@@ -2,7 +2,7 @@
 import os
 
 # 项目根目录（用绝对路径，确保 spec 被复制到临时目录时仍能定位资源）
-ROOT = r'{{DEV_ROOT}}\诉讼案件网站'
+ROOT = os.path.abspath(SPECPATH)      # 由 spec 所在目录推导，不写死本机路径
 ASSETS = os.path.join(ROOT, 'assets')
 ICON = os.path.join(ASSETS, 'app.ico')
 

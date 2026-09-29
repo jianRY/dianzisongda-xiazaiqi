@@ -30,3 +30,6 @@ dist/
 
 # 资料库上传中间物
 _project_upload/
+
+# 本机私有端点（源站地址等，绝不入库）
+_endpoints.py

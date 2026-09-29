@@ -72,9 +72,15 @@ UA = (
 
 # ---------------- 自有下载站（2026-09-22 新增） ----------------
 # 起因：用户反馈从 GitHub 下载又慢又容易超时。本机搭了国内下载站
-# （阿里云 download.internal:8888），更新元数据与 exe 都同步过去，
+# （自建国内下载站，地址不写死在库里 —— 见下方 SITE_URL），更新元数据与 exe 都同步过去，
 # 检查更新与下载都优先走它，GitHub 只作兜底。
-SITE_URL = "http://download.internal:8888"
+# ⚠️ 源站地址**刻意不写死在公开仓库里**（避免暴露源站 IP）。
+# 本机把它放在不入库的 _endpoints.py 里；缺失时该源自动禁用，
+# 其余下载源（加速镜像 / GitHub 原站）照常工作，不影响任何功能。
+try:
+    from _endpoints import SITE_URL            # 本机私有配置，.gitignore 已排除
+except Exception:                              # 源码公开 / 未配置
+    SITE_URL = ""
 
 # GitHub 仓库 → 服务器上的 update.json 文件名（与更新源 REPOS 配置一致）
 _REPO_TO_APP = {
@@ -88,13 +94,13 @@ def _server_meta_url(api_url):
     """从 GitHub API 地址推出自有服务器上的 update.json 地址；认不出则返回 None。
 
     https://api.github.com/repos/<owner>/<repo>/releases/latest
-        → http://download.internal:8888/updates/<app>.json
+        → <自有下载站>/updates/<app>.json
     """
     m = re.search(r"repos/([^/]+/[^/]+)/releases", str(api_url or ""))
     if not m:
         return None
     key = _REPO_TO_APP.get(m.group(1).lower())
-    return "%s/updates/%s.json" % (SITE_URL, key) if key else None
+    return "%s/updates/%s.json" % (SITE_URL, key) if (key and SITE_URL) else None
 
 
 # ---------------- 公共 GitHub 加速镜像（2026-09-22 新增，同日调整为「主源」） ----------------
@@ -146,7 +152,7 @@ def _src_label(url):
     for p in MIRROR_PREFIXES:
         if u.startswith(p):
             return "加速镜像 %s" % p.split("//")[1].strip("/")
-    if u.startswith(SITE_URL):
+    if SITE_URL and u.startswith(SITE_URL):
         return "自有服务器"
     if "github.com/" in u:
         return "GitHub 原站"
