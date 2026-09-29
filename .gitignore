@@ -25,9 +25,8 @@ chunk_*
 # 本地记忆（不发布）
 .workbuddy/
 
-# 保留预编译 exe（dist/法院文书下载器.exe）
-!dist/
-!dist/*.exe
+# 构建产物不入库（exe 通过 GitHub Releases 分发，仓库不再存二进制）
+dist/
 
 # 资料库上传中间物
 _project_upload/
