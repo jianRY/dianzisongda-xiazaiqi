@@ -33,3 +33,23 @@ _project_upload/
 
 # 本机私有端点（源站地址等，绝不入库）
 _endpoints.py
+
+# ---- 敏感文件：凭据 / 证书 / 私钥 —— 任何情况下都不入库 ----
+token.txt
+*.token
+.github_token
+gh_token.txt
+*.pfx
+*.pvk
+*.p12
+*.pem
+*.key
+pfx_pass.txt
+signing/
+.env
+.env.*
+local_config.json
+id_rsa
+id_ed25519
+.netrc
+.git-credentials
