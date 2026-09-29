@@ -187,7 +187,7 @@
 (function(){
   var REPO = 'jianRY/dianzisongda-xiazaiqi';
   var API = 'https://api.github.com/repos/' + REPO + '/releases?per_page=5';
-  /* 自有下载站的更新元数据（国内直连，快）。服务器脚本从 Release 抄过来，
+  /* 备用下载源的更新元数据（国内直连，快）。服务器脚本从 Release 抄过来，
      含版本号 / 更新说明 / 服务器直链 / GitHub 兜底直链。取到就优先用它。 */
   /* ⚠️ 用「同站相对路径」而不是写死地址：官网本身部署在下载站上，
      相对路径会自动解析到同一站点的 /updates/court.json（源码里因此不含源站地址）。
@@ -195,7 +195,7 @@
   var SERVER_META = 'updates/court.json';
   var serverOK = false;
   /* GitHub 加速镜像（2026-09-22）：浏览器直接点 GitHub 直链，在国内基本下不动；
-     而自有服务器元数据又可能取不到（跨域被拦 / 服务器尚未同步），
+     而备用源元数据又可能取不到（跨域被拦 / 服务器尚未同步），
      此时用镜像前缀拼出下载链接 —— 与软件内自动更新用的是同一批镜像。
      ⚠️ 镜像属第三方服务、可能失效；换源时本处与 autoupdate.py 的
         MIRROR_PREFIXES 要一起改，别只改一边。 */
@@ -221,7 +221,7 @@
   }
   function fmtMB(n){ return (n/1024/1024).toFixed(1) + ' MB'; }
 
-  /* ① 先取自有服务器上的元数据（国内直连，秒回）：点亮版本徽章、把两个下载按钮
+  /* ① 先取备用源上的元数据（国内直连，秒回）：点亮版本徽章、把两个下载按钮
      指向服务器直链。失败就什么都不做，交给下面的 GitHub API 兜底。 */
   fetch(SERVER_META, {cache:'no-store'})
     .then(function(r){ if(!r.ok) throw new Error('http ' + r.status); return r.json(); })
@@ -231,7 +231,7 @@
       document.getElementById('verBadge').innerHTML =
         '最新版本 <b>v' + esc(String(m.version).replace(/^v/,'')) + '</b>';
       var g = document.getElementById('dlGreen'), s = document.getElementById('dlSetup');
-      /* 优先自有服务器直链：国内快、稳，且与上面「国内直连下载（不经 GitHub）」的说明一致。
+      /* 优先备用源直链：国内快、稳，且与上面「国内直连下载（不经 GitHub）」的说明一致。
          曾经这里只用了 m.url（GitHub 直链），结果文案说"不经 GitHub"、链接却跳 GitHub，
          国内用户点下去基本下不动 —— 必须优先 fallback_url。 */
       if(m.fallback_url || m.url) g.href = m.fallback_url || m.url;

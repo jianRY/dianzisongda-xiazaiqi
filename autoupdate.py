@@ -70,7 +70,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-# ---------------- 自有下载站（2026-09-22 新增） ----------------
+# ---------------- 备用下载源（2026-09-22 新增） ----------------
 # 起因：用户反馈从 GitHub 下载又慢又容易超时。本机搭了国内下载站
 # （自建国内下载站，地址不写死在库里 —— 见下方 SITE_URL），更新元数据与 exe 都同步过去，
 # 检查更新与下载都优先走它，GitHub 只作兜底。
@@ -91,10 +91,10 @@ _REPO_TO_APP = {
 
 
 def _server_meta_url(api_url):
-    """从 GitHub API 地址推出自有服务器上的 update.json 地址；认不出则返回 None。
+    """从 GitHub API 地址推出备用源上的 update.json 地址；认不出则返回 None。
 
     https://api.github.com/repos/<owner>/<repo>/releases/latest
-        → <自有下载站>/updates/<app>.json
+        → <备用下载源>/updates/<app>.json
     """
     m = re.search(r"repos/([^/]+/[^/]+)/releases", str(api_url or ""))
     if not m:
@@ -108,8 +108,8 @@ def _server_meta_url(api_url):
 # 而镜像之间也差近 10 倍 —— 同一次实测：gh-proxy.com 439.6 KB/s、
 # ghfast.top 222.8 KB/s、ghproxy.net 45.6 KB/s。所以下载前先探测速度择优。
 #
-# 定位（2026-09-22 调整）：镜像 = **主源**；GitHub 原站与自有服务器直链退为兜底。
-#   注：自有服务器是阿里云 ECS 固定带宽，实测封顶 445 KB/s（4 并发合计仍 417 KB/s，
+# 定位（2026-09-22 调整）：镜像 = **主源**；GitHub 原站与备用源直链退为兜底。
+#   注：备用源是阿里云 ECS 固定带宽，实测封顶 445 KB/s（4 并发合计仍 417 KB/s，
 #   说明是带宽上限，加线程无用），已不再比镜像快，故让出主源位置。
 #
 # ⚠️ 三条硬约束（改这里之前先读）：
@@ -118,7 +118,7 @@ def _server_meta_url(api_url):
 #        ghproxy.cfd / hk.gh-proxy.com 全部拿不到连接）。
 #      所以列表**硬编码在客户端、靠发版换源**，不写进 update.json。
 #   ② 探测失败的源一律**不丢弃**，只排到最后继续尝试（探测失败 ≠ 不能下载）。
-#   ③ GitHub 原站与自有服务器直链永远保留在候选里兜底。
+#   ③ GitHub 原站与备用源直链永远保留在候选里兜底。
 MIRROR_PREFIXES = (
     "https://gh-proxy.com/",
     "https://ghfast.top/",
@@ -137,7 +137,7 @@ def _is_mirror(url):
 
 def _src_rank(url):
     """源的优先级别（仅在实测速度都达标时作并列排序的次要依据）：
-    0 = 加速镜像（CDN，天花板高）→ 1 = GitHub 直连 → 2 = 自有服务器（兜底）。"""
+    0 = 加速镜像（CDN，天花板高）→ 1 = GitHub 直连 → 2 = 备用源（兜底）。"""
     u = str(url or "")
     if _is_mirror(u):
         return 0
@@ -153,7 +153,7 @@ def _src_label(url):
         if u.startswith(p):
             return "加速镜像 %s" % p.split("//")[1].strip("/")
     if SITE_URL and u.startswith(SITE_URL):
-        return "自有服务器"
+        return "备用源"
     if "github.com/" in u:
         return "GitHub 原站"
     try:
@@ -163,7 +163,7 @@ def _src_label(url):
 
 
 def build_download_sources(urls):
-    """把候选下载地址展开成有序列表：加速镜像 → 自有服务器 → GitHub 直链兜底。
+    """把候选下载地址展开成有序列表：加速镜像 → 备用源 → GitHub 直链兜底。
 
     GitHub 直链会额外派生出镜像版本（同一文件，走 CDN），原链保留在最后：
     国内实测直连 4 KB/s，只能当万不得已的兜底。
@@ -215,8 +215,8 @@ def rank_sources(urls, timeout=PROBE_TIMEOUT, on_probe_done=None):
     """并发探活后排出尝试顺序。
 
     排序规则（刻意不做「全局按速度排序」—— 小样本测不出 CDN 镜像的真实能力，
-    而且会让自有服务器在偶尔测速偏高时插到镜像前面，违背「镜像优先、本站兜底」）：
-      组优先：0 = 加速镜像 → 1 = GitHub 直链 → 2 = 自有服务器（**永远兜底**）
+    而且会让备用源在偶尔测速偏高时插到镜像前面，违背「镜像优先、本站兜底」）：
+      组优先：0 = 加速镜像 → 1 = GitHub 直链 → 2 = 备用源（**永远兜底**）
       组内：① 健康的（达到 MIN_USEFUL_SPEED）在前；
             ② 再按探测速度降序；
             ③ 最后按原顺序，保证结果稳定可复现。
@@ -252,7 +252,7 @@ def rank_sources(urls, timeout=PROBE_TIMEOUT, on_probe_done=None):
         s = speeds.get(u, 0.0)
         healthy = s >= MIN_USEFUL_SPEED / 1024.0
         return (
-            _src_rank(u),           # 组：0 加速镜像 → 1 GitHub 原站 → 2 自有服务器（兜底）
+            _src_rank(u),           # 组：0 加速镜像 → 1 GitHub 原站 → 2 备用源（兜底）
             0 if healthy else 1,    # 组内：健康的在前，探测失败的排后（但不丢弃）
             -s,                     # 组内再按实测速度降序
             idx,                    # 最后按原顺序，保证结果稳定可复现
@@ -415,10 +415,10 @@ def _release_meta_url(api_url):
 
 
 def fetch_update_info(latest_api_url, timeout=5, log_fn=None):
-    """按「加速镜像 → GitHub 原站 → 自有服务器 → GitHub API」依次尝试取更新信息。
+    """按「加速镜像 → GitHub 原站 → 备用源 → GitHub API」依次尝试取更新信息。
 
-    2026-09-22 调整：源顺序反转 —— 主源改为 GitHub 加速镜像，自有服务器退为兜底。
-    起因是实测裸网直连 GitHub 只有 3.7 KB/s，而镜像能到 439 KB/s；自有服务器
+    2026-09-22 调整：源顺序反转 —— 主源改为 GitHub 加速镜像，备用源退为兜底。
+    起因是实测裸网直连 GitHub 只有 3.7 KB/s，而镜像能到 439 KB/s；备用源
     受阿里云 ECS 固定带宽限制封顶 445 KB/s，已不再有速度优势。
 
     为什么 update.json 必须排在 GitHub API 之前：
@@ -444,7 +444,7 @@ def fetch_update_info(latest_api_url, timeout=5, log_fn=None):
         meta_urls.append((rel, _src_label(rel)))
     srv = _server_meta_url(latest_api_url)
     if srv:
-        meta_urls.append((srv, "自有服务器"))
+        meta_urls.append((srv, "备用源"))
 
     for url, source in meta_urls:
         try:
@@ -1145,7 +1145,7 @@ class DownloadProgressDialog(tk.Toplevel):
             st["running"] = False
             return
 
-        # 阶段一：并发探活，把死源/病源挪到队尾（镜像优先，其次自有服务器）
+        # 阶段一：并发探活，把死源/病源挪到队尾（镜像优先，其次备用源）
         if len(sources) > 1:
             st["phase"] = "正在选择最快的下载源…"
             sources = rank_sources(sources, on_probe_done=self._log_speeds)
