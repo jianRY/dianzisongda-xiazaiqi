@@ -8,7 +8,7 @@
 
 全国法院统一送达平台电子送达文书自动下载工具。粘贴送达短信或链接，自动提取该案件全部文书并下载为 PDF，支持**多线程并发下载**、批量、转 JPG、防合并命名、自动更新（含更新内容展示 / 三选项 / 进度速度 / 随时取消）。
 
-## 功能特性（v2.10.2）
+## 功能特性（v2.11.0）
 
 - 自动识别 `zxfw.court.gov.cn` 送达链接（支持整段短信 / 一次粘贴多个链接批量下载）
 - **容错粘贴**：链接后面跟中文标点（`，。；：？！【】「」` 等）也能正确识别参数 —— 法院短信的标准句式就是「……&sdsin=XXX，请及时查阅。」，直接整段粘贴即可
@@ -20,7 +20,8 @@
 - **下载完整性校验**：比对 Content-Length，截断的坏文件自动重试；并拦截服务端返回的错误页
 - **支持非 PDF 文书**：jpg / docx / xlsx 等格式按格式给出正确扩展名（不再一律命名成 `.pdf`），且不会被文件头校验误判为失败
 - **跳过已存在的同名文书**（默认开启）：识别到案号时复用同一案件上次的文件夹，已下过的文书真正跳过；若全部已存在会如实提示「本次未重复下载」
-- **自动更新**（`autoupdate.py` 通用模块）：启动检查更新 → 弹窗显示本次更新内容 → 立即更新 / 本次忽略 / 以后不再提醒 → 下载显示进度与速度、可随时取消 → **新版就地放进程序目录、自动重启并清理旧版文件**；关闭程序后自动把文件名改成带实际版本号的名字（安装版保持固定名 `法院文书下载器.exe`，快捷方式与卸载始终有效）
+- **自动更新**（`autoupdate.py` 通用模块）：启动检查更新 → 弹窗显示本次更新内容 → 立即更新 / 本次忽略 / 以后不再提醒 → 下载显示进度与速度、可随时取消 → **新版就地放进程序目录、自动重启**；关闭程序后自动把文件名改成带实际版本号的名字（安装版保持固定名 `法院文书下载器.exe`，快捷方式与卸载始终有效）
+- **更新后是否删除旧版由你决定**：提示升级窗口里带一个复选框，**默认勾选**（与原行为一致）；取消勾选则保留旧版 exe，万一新版不合适可直接双击回退，选择会被记住
 - 保存路径可选、可手填，开始下载前自动校验可写性，并记住上次选择
 - 下载完成后打开文件夹（三档：不打开 / 打开根目录 / 打开每个案件文件夹）
 - 下载中关闭窗口会先确认，未完成文件自动清理
@@ -63,7 +64,7 @@ python court_doc_downloader_gui.py
 pip install pyinstaller pymupdf
 
 # 先生成版本资源（PyInstaller 会把这个文件当 Python 源码 eval，格式必须对）
-python .pybuild_cache/make_version_file.py 2.10.2 法院文书下载器 version_info.txt
+python .pybuild_cache/make_version_file.py 2.11.0 法院文书下载器 version_info.txt
 
 pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
   --exclude-module numpy --exclude-module PIL \
@@ -79,8 +80,8 @@ pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
 **安装包**（需先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)）：
 
 ```bash
-python installer/make_assets.py 2.10.2    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
-ISCC.exe installer.iss /DAppVersion=2.10.2 /DSrcExe="dist\法院文书下载器_v2.10.2.exe"
+python installer/make_assets.py 2.11.0    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
+ISCC.exe installer.iss /DAppVersion=2.11.0 /DSrcExe="dist\法院文书下载器_v2.11.0.exe"
 ```
 
 `installer.iss` **不再提供默认版本号**（写死的默认值会让「忘记传参」变成静默的错误版本），漏传 `/DAppVersion` 会直接编译失败。
@@ -89,7 +90,7 @@ ISCC.exe installer.iss /DAppVersion=2.10.2 /DSrcExe="dist\法院文书下载器_
 
 | 文件                            | 说明                               |
 | ----------------------------- | -------------------------------- |
-| `court_doc_downloader_gui.py` | 图形界面主程序（v2.10.2）                 |
+| `court_doc_downloader_gui.py` | 图形界面主程序（v2.11.0）                 |
 | `autoupdate.py`               | 通用自动更新模块（三行接入，可复用到其他 Tkinter 软件） |
 | `court_doc_downloader.py`     | 命令行版（零依赖，仅标准库 urllib）            |
 | `ui_kit.py`                   | 自绘控件库（圆角按钮 / 复选框 / 分段控件 / 进度条 / 日志视图） |
