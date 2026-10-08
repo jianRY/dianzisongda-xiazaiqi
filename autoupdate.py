@@ -337,6 +337,34 @@ def _save_auto_update(config_file, enabled):
         pass
 
 
+def _load_cleanup_old(config_file):
+    """读上次的选择；没有记录 / 读不出来 → True（默认删旧版，与最初行为一致）。"""
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("cleanup_old", True))
+    except Exception:
+        return True
+
+
+def _save_cleanup_old(config_file, enabled):
+    """记住勾选状态。失败静默 —— 只是下次弹窗的默认值，不值得因此打断更新。"""
+    try:
+        data = {}
+        if config_file and os.path.exists(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data["cleanup_old"] = bool(enabled)
+        os.makedirs(os.path.dirname(config_file) or ".", exist_ok=True)
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 # ---------------- 取 Release 信息 ----------------
 # 安装包（Setup / Installer / 安装版）绝不能当作自动更新的下载源：
 # 就地更新会把它搬进程序目录并改名成主程序名，等于用安装器覆盖程序本体。
@@ -571,13 +599,27 @@ def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None):
                   log_fn=log_fn, max_wait=max_wait, prefixes=prefixes)
 
 
-def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None):
-    """删除 directory 下所有「本程序旧版/中间」文件（排除 current）。"""
+def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None,
+           cleanup_old=True):
+    """删除 directory 下所有「本程序旧版/中间」文件（排除 current）。
+
+    cleanup_old=False（用户在更新弹窗里取消了「更新后自动删除旧版本文件」）：
+        **完全不动这些文件**，旧版本原样保留在程序目录里。
+        注意这里只是「不删」，settle_after_update 里的改名逻辑照旧执行
+        （旧版会被挪成 `xxx_旧版_<时间戳>.exe`，仍占着磁盘，但用户明确要求保留）。
+    """
     stem, ext = os.path.splitext(os.path.basename(current))
     if prefixes:
         pat = _old_version_pattern_multi(prefixes, ext)
     else:
         pat = _old_version_pattern(_base_stem(stem), ext)
+
+    def _log(msg):
+        try:
+            if log_fn:
+                log_fn(msg)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _scan():
         found = []
@@ -589,6 +631,17 @@ def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None):
         except OSError:
             pass
         return found
+
+    if not cleanup_old:
+        # 用户明确要求保留旧版本 → 一个字节都不删，只如实告知留下了什么
+        kept = [os.path.basename(p) for p in _scan()]
+        if log_fn:
+            try:
+                log_fn("已保留旧版本文件（未勾选自动删除）：%s"
+                       % ("、".join(kept) if kept else "当前目录无旧版残留"))
+            except Exception:  # noqa: BLE001
+                pass
+        return []
 
     removed, deadline = [], time.time() + max_wait
     while True:
@@ -609,6 +662,54 @@ def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None):
         except Exception:  # noqa: BLE001
             pass
     return removed
+
+
+# ------------------------------------------------- 「更新后删除旧版」跨进程传递
+# 为什么需要它：复选框是在**旧版进程**的更新弹窗里勾的，而删旧版这个动作发生在
+# **新版进程**的 settle_after_update() 里 —— 两个不同的进程，没有共享内存，
+# 只能靠一个文件把用户的选择传过去。
+#
+# 落盘位置选「程序所在目录」而不是配置目录：更新期间程序目录一定可写
+# （就地更新本来就要往那儿写新 exe），而配置目录在别的模块里、不一定传得进来。
+_CLEANUP_FLAG = "_更新保留旧版.flag"
+
+
+def write_cleanup_flag(directory, cleanup_old):
+    """旧版进程：把用户的选择写进程序目录，供新版启动时读取。"""
+    if not directory:
+        return False
+    path = os.path.join(directory, _CLEANUP_FLAG)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("cleanup_old=%s" % ("1" if cleanup_old else "0"))
+        return True
+    except OSError:
+        return False
+
+
+def read_and_consume_cleanup_flag(directory):
+    """新版进程：读取旧版留下的选择并删掉标记文件。
+
+    返回 True/False 表示要不要删旧版；**文件不存在时返回 True**（默认保持原行为，
+    不因为机制故障就悄悄改成「保留一堆旧版文件」）。
+
+    必须「读完就删」：这个文件表达的是「本次更新」的意图，若留着会被下一次启动
+    当成新决策反复生效，用户后来改了勾选状态也不生效。
+    """
+    path = os.path.join(directory or "", _CLEANUP_FLAG)
+    try:
+        if not os.path.exists(path):
+            return True
+        with open(path, "r", encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return True
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return "cleanup_old=0" not in txt.replace(" ", "")
 
 
 # ---------------------------------------------------------------- 待改名登记
@@ -688,7 +789,7 @@ def apply_pending_rename(log_fn=None):
         return False
 
 
-def settle_after_update(log_fn=None, app_name=None, version=None):
+def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=None):
     """程序启动时调用：登记「退出时要改的文件名」，并清掉更新留下的旧版文件。
 
     ⚠️ **本函数不再在启动时改名**（原因见上方 `_PENDING_RENAME` 段的实测铁律）。
@@ -698,6 +799,13 @@ def settle_after_update(log_fn=None, app_name=None, version=None):
       · 安装版（光名字 `法院文书下载器.exe`）→ 保持固定名，快捷方式与卸载才不会断
       · 绿色版 → `法院文书下载器_v<当前版本>.exe`，名字与实际版本永远一致
     规则幂等：名字已经对了就什么都不做，所以每次启动调用都安全。
+
+    cleanup_old: 是否删除旧版本文件。
+      · True  → 清理（旧行为）
+      · False → **保留**旧版本文件（用户在更新弹窗里取消了勾选）
+      · None（默认）→ 自动读旧版进程留下的标记文件（read_and_consume_cleanup_flag），
+        所以**调用方不做任何改动**也能拿到用户在弹窗里的选择；标记文件不存在时按 True 处理。
+    注意：cleanup_old=False 只是「不删」，上面的挪名/登记待改名照旧执行。
 
     为什么新版要先用中间名启动，而不是直接顶替原文件名：
         实测（Windows 10/11 + PyInstaller onefile）**无法在「当前运行进程自己的
@@ -724,6 +832,12 @@ def settle_after_update(log_fn=None, app_name=None, version=None):
     base = _base_stem(stem)                          # 更新前的基准名
     target = desired_base_name(app_name, version, base)   # 更新后该有的名字
     final = os.path.join(directory, target + ext)
+
+    # 清理策略：调用方显式给了就用，没给就读旧版进程留下的标记文件（用户勾了什么）
+    if cleanup_old is None:
+        cleanup_old = read_and_consume_cleanup_flag(directory)
+    _log("旧版本文件处理方式：%s" % ("更新完成后自动删除"
+                                   if cleanup_old else "保留（用户取消了勾选）"))
 
     # ① 名字不对时：腾位置 + 登记待改名（**不在这里动手**）
     if os.path.abspath(current).lower() != os.path.abspath(final).lower():
@@ -753,16 +867,21 @@ def settle_after_update(log_fn=None, app_name=None, version=None):
     prefixes = [base, target]
     if app_name:
         prefixes.insert(0, app_name)
-    return _purge(directory, current, log_fn=log_fn, max_wait=12.0, prefixes=prefixes)
+    return _purge(directory, current, log_fn=log_fn, max_wait=12.0,
+                  prefixes=prefixes, cleanup_old=cleanup_old)
 
 
-def windows_replace_and_restart(new_exe_path, log_fn=None):
+def windows_replace_and_restart(new_exe_path, log_fn=None, cleanup_old=True):
     """就地更新：把下载好的新 exe 放进程序目录，启动它，本进程退出。
 
     步骤（全在本进程内完成，不生成任何外部脚本、不做进程退出轮询）：
         ① 新 exe 搬进程序目录，暂用中间名 xxx_更新中.exe
-        ② 以中间名启动它（**不能**用原文件名，见 settle_after_update 里的说明）
-        ③ 本进程退出；新版启动后由 settle_after_update() 接管原文件名并删掉旧版
+        ② 把「是否删除旧版本」写进标记文件（跨进程传给新版）
+        ③ 以中间名启动它（**不能**用原文件名，见 settle_after_update 里的说明）
+        ④ 本进程退出；新版启动后由 settle_after_update() 接管原文件名并按标记决定删不删旧版
+
+    cleanup_old: 用户在更新弹窗里的选择（默认 True = 删，与旧行为一致）。
+                 这里只负责传下去，真正删除发生在新进程里。
 
     new_exe_path: 下载好的新版 exe 路径（通常位于临时目录）。
     失败时抛 RuntimeError，调用方负责提示。下载失败时文件原封不动。
@@ -802,7 +921,13 @@ def windows_replace_and_restart(new_exe_path, log_fn=None):
             raise RuntimeError("无法把新版本写入程序目录（%s）：%s" % (directory, e))
     _log("新版本已放入程序目录：%s" % os.path.basename(staging))
 
-    # ② 启动新版。用中间名（而非原文件名）启动：Windows 不允许在「当前进程自己的
+    # ② 把「删不删旧版本」写进标记文件 —— 新版进程读不到本进程的变量，
+    #    只能靠文件跨进程传递。必须在启动新版**之前**写好。
+    if write_cleanup_flag(directory, cleanup_old):
+        _log("旧版本文件处理方式已传给新版本：%s"
+             % ("更新完成后自动删除" if cleanup_old else "保留旧版本文件"))
+
+    # ③ 启动新版。用中间名（而非原文件名）启动：Windows 不允许在「当前进程自己的
     #    映像路径」上启动新进程，用原名会静默失败（引导器起来、真实程序起不来）。
     started = False
     if hasattr(os, "startfile"):
@@ -852,11 +977,15 @@ def _center_on(master, w, h):
 # ---------------- 主入口 ----------------
 def run_update_check(parent, app_name, current_version, latest_api_url, config_file,
                      install_helper=None, log_fn=None, manual=False,
-                     on_before_install=None):
+                     on_before_install=None, cleanup_old=None):
     """启动检查（后台线程）。manual=True 时失败/无更新也弹提示，且忽略 auto_update 开关。
 
     on_before_install: 可选回调。新版本已就位、程序即将退出前调用，
                        宿主可在此停掉后台任务 / 保存状态 / 销毁窗口，确保进程真正退出。
+
+    cleanup_old: 「更新后是否删除旧版本文件」复选框的**默认勾选状态**。
+                 None（默认）→ 读上次的记录；没有记录则默认勾选（保持原行为）。
+                 用户在弹窗里改了选择后，新选择会被记住并用于下次。
     """
     if install_helper is None:
         install_helper = windows_replace_and_restart
@@ -895,6 +1024,9 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
             return
 
         # 有新版 → 主线程弹窗
+        # cleanup_old 默认值：宿主显式传 > 配置文件里的上次选择 > 默认勾选
+        default_cleanup = (_load_cleanup_old(config_file) if cleanup_old is None
+                           else bool(cleanup_old))
         parent.after(0, lambda: UpdateDialog(
             parent, app_name=app_name, current_version=current_version,
             tag=tag, notes=info.get("notes", ""),
@@ -902,6 +1034,7 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
             html_url=info.get("html_url", ""),
             config_file=config_file, install_helper=install_helper, log_fn=log_fn,
             on_before_install=on_before_install,
+            cleanup_old_default=default_cleanup,
         ))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -912,7 +1045,8 @@ class UpdateDialog(tk.Toplevel):
     def __init__(self, master, app_name, current_version, tag, notes,
                  download_url=None, config_file=None, install_helper=None,
                  log_fn=None, on_before_install=None,
-                 download_urls=None, sha256="", html_url=""):
+                 download_urls=None, sha256="", html_url="",
+                 cleanup_old_default=True):
         super().__init__(master)
         self.title("发现新版本 · %s" % app_name)
         self.configure(bg="#F2F4F8")
@@ -950,8 +1084,19 @@ class UpdateDialog(tk.Toplevel):
             txt.insert("1.0", _strip_md(notes))
             txt.configure(state="disabled")
 
+        # 「更新后是否删除旧版本文件」：默认勾选（= 保持旧行为）。
+        # 取消勾选时旧版本 exe 会保留在程序目录里（可用来回退）。
+        # 放在按钮**上方**：它是本次更新的前置选择，与「立即更新」同属一个决策区；
+        # 放到按钮下面会紧贴窗口底边，看起来像按钮的副标题。
+        self._keep_old = tk.BooleanVar(value=cleanup_old_default)
+        ttk.Checkbutton(
+            frm, text="更新后自动删除旧版本文件（取消勾选则保留旧版，便于回退）",
+            variable=self._keep_old,
+        ).pack(anchor="w", pady=(0, 8))
+
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(4, 0))
+
         # 统一按钮样式：主按钮蓝色实底 + 白字加粗，次按钮浅灰 + 深字常规，
         # 三者字号 / 内边距 / 圆角观感一致（tk.Button 扁平化，ttk 在 vista 主题下改不了底色）
         def _mkbtn(parent, text, cmd, primary=False):
@@ -984,6 +1129,16 @@ class UpdateDialog(tk.Toplevel):
         self.destroy()
 
     def _on_update(self):
+        cleanup_old = bool(self._keep_old.get())
+        # 记住这次选择，下次弹窗用同样的默认值（配置写失败不影响更新本身）
+        _save_cleanup_old(self._config_file, cleanup_old)
+        if self._log_fn:
+            try:
+                self._log_fn("旧版本文件处理方式：%s"
+                             % ("更新完成后自动删除" if cleanup_old
+                                else "保留旧版本文件（用户取消了勾选）"))
+            except Exception:  # noqa: BLE001
+                pass
         self._close()
         DownloadProgressDialog(
             self.master, app_name=self._app_name,
@@ -991,6 +1146,7 @@ class UpdateDialog(tk.Toplevel):
             download_urls=self._download_urls, sha256=self._sha256,
             install_helper=self._install_helper, log_fn=self._log_fn,
             on_before_install=self._on_before_install,
+            cleanup_old=cleanup_old,
         )
 
     def _on_skip(self):
@@ -1023,7 +1179,7 @@ class DownloadProgressDialog(tk.Toplevel):
 
     def __init__(self, master, app_name, download_url=None, install_helper=None,
                  log_fn=None, on_before_install=None,
-                 download_urls=None, sha256=""):
+                 download_urls=None, sha256="", cleanup_old=True):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
         self.configure(bg="#F2F4F8")
@@ -1040,7 +1196,10 @@ class DownloadProgressDialog(tk.Toplevel):
         self._install_helper = install_helper
         self._log_fn = log_fn
         self._on_before_install = on_before_install
-
+        # 「是否删除旧版本」：由更新弹窗的复选框决定，透传给 install_helper。
+        # install_helper 可能被宿主换成自定义函数，所以**用关键字传**并在调用处
+        # 兼容旧签名（只接受 2 个位置参数的老函数）——别把宿主的老回调弄崩。
+        self._cleanup_old = bool(cleanup_old)
         self._cancel_evt = threading.Event()
         self._has_spare = False
         self._state = {"done": 0, "total": 0, "running": True,
@@ -1281,7 +1440,7 @@ class DownloadProgressDialog(tk.Toplevel):
             return
         # 成功 → 交给宿主安装（默认：就地落位 + 启动新版）
         try:
-            self._install_helper(done_path, self._log_fn)
+            self._call_install_helper(done_path)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("更新失败", "更新未完成：%s" % e)
             return
@@ -1293,6 +1452,38 @@ class DownloadProgressDialog(tk.Toplevel):
         except Exception:  # noqa: BLE001
             pass
         self._exit_app()
+
+    def _call_install_helper(self, done_path):
+        """调用宿主给的安装函数，并带上 cleanup_old。
+
+        为什么要这么啰嗦：`install_helper` 是开放给宿主的回调，**可能有项目还在用
+        只接受 2 个位置参数的老签名**（不接 cleanup_old）。直接多传关键字会让它抛
+        TypeError → 用户看到「更新未完成」，但其实文件已经下好了，比不做还糟。
+        所以：先按新签名试，被拒绝就退回老签名，并把选择写进模块级变量
+        （老签名走的是 windows_replace_and_restart 默认值，这里额外补一次标记文件）。
+        """
+        try:
+            self._install_helper(done_path, self._log_fn,
+                                 cleanup_old=self._cleanup_old)
+            return
+        except TypeError as e:
+            # 只在「参数不匹配」时退回；安装逻辑内部的 TypeError 必须暴露出来
+            if "cleanup_old" not in str(e):
+                raise
+            if self._log_fn:
+                try:
+                    self._log_fn("安装函数使用旧签名，改为默认保留旧版本的清理策略。")
+                except Exception:  # noqa: BLE001
+                    pass
+            # 老签名拿不到 cleanup_old → 直接把选择写进标记文件，
+            # 新版照样能读到（windows_replace_and_restart 还会再用它一次，无副作用）
+            if not self._cleanup_old and _is_frozen():
+                try:
+                    write_cleanup_flag(os.path.dirname(os.path.abspath(sys.executable)),
+                                       False)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._install_helper(done_path, self._log_fn)
 
     def _exit_app(self):
         """关闭主窗口并结束进程。
