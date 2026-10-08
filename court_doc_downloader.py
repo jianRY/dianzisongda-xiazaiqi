@@ -259,10 +259,15 @@ def safe_ext(wjgs, url):
     c_wjgs 可能是 'pdf' / '.PDF' / 'application/pdf' 等形态，统一清洗成小写扩展名；
     清洗不出合法扩展名时再从 URL 猜，最后兜底 .pdf。
     旧实现直接拼 '.'+c_wjgs，遇到 'application/pdf' 会得到非法文件名。
+
+    ⚠️ 类型安全：c_wjgs 来自**外部 HTTP 接口的 JSON**，不能假定它一定是字符串。
+    实测 wjgs=123 会走 `cand="123"` 判定为合法扩展名 → 产出 `.123`，
+    用户双击「判决书.123」根本打不开。数字/布尔/容器一律视为「无效声明」。
     """
     ext = ""
     if wjgs:
-        raw = str(wjgs).strip().lower().lstrip(".")
+        # 只接受真正的字符串；数字、布尔、list、dict 等一律忽略（走 URL 推断 → 兜底 .pdf）
+        raw = wjgs.strip().lower().lstrip(".") if isinstance(wjgs, str) else ""
         # ① 先查 MIME 映射表（application/msword → .doc 这类必须走表，
         #    压成单词后再判断长度会被误判成非法 → 回落 .pdf，Word 文档就废了）
         if raw in _MIME_EXT:
@@ -278,7 +283,9 @@ def safe_ext(wjgs, url):
                     if sep in cand:
                         cand = cand.split(sep)[-1]
                         break
-            if 1 <= len(cand) <= 5:
+            # 扩展名必须是**纯字母**且 1~5 位：挡住 ".123"（数字）、".true"（布尔）
+            # 这类由非字符串值拼出来的东西
+            if 1 <= len(cand) <= 5 and cand.isalpha():
                 ext = "." + cand.lower()
     if not ext:
         m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", url or "")

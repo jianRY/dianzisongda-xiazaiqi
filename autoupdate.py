@@ -575,7 +575,7 @@ def desired_base_name(app_name, version, fallback):
     return "%s_v%s" % (app_name, version)
 
 
-def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None):
+def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None, cleanup_old=None):
     """删除程序目录里遗留的「旧版 / 更新中」文件。
 
     只在打包运行时生效；开发态直接返回，不做任何事。
@@ -584,6 +584,11 @@ def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None):
 
     app_name 传了就用「多前缀」规则（见 _old_version_pattern_multi），
     以覆盖改名后基准名变化的情况；不传则沿用旧的单前缀规则。
+
+    cleanup_old: 与 settle_after_update 同义 —— None 时自动读旧版进程留下的
+    标记文件（用户在更新弹窗里勾了什么），True/False 则显式指定。
+    这个函数是**对外公开接口**，不接这个参数会造成「同一份配置、不同函数
+    行为不一致」的坑，所以必须透传。
     """
     if not _is_frozen():
         return []
@@ -591,12 +596,15 @@ def cleanup_old_versions(log_fn=None, max_wait=8.0, app_name=None):
         current = os.path.abspath(sys.executable)
     except Exception:  # noqa: BLE001
         return []
+    if cleanup_old is None:
+        cleanup_old = read_and_consume_cleanup_flag(os.path.dirname(current))
     prefixes = None
     if app_name:
         prefixes = [app_name,
                     _base_stem(os.path.splitext(os.path.basename(current))[0])]
     return _purge(directory=os.path.dirname(current), current=current,
-                  log_fn=log_fn, max_wait=max_wait, prefixes=prefixes)
+                  log_fn=log_fn, max_wait=max_wait, prefixes=prefixes,
+                  cleanup_old=cleanup_old)
 
 
 def _purge(directory, current, log_fn=None, max_wait=8.0, prefixes=None,
@@ -1423,7 +1431,12 @@ class DownloadProgressDialog(tk.Toplevel):
         except Exception:
             pass
         self.destroy()
+        # 记下临时文件路径：取消/失败时要用它清掉半截的 exe。
+        # （成功时不能删 —— 那一路要交给 install_helper 搬进程序目录）
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
         if cancelled:
+            self._discard_partial(tmp)
             if self._log_fn:
                 try:
                     self._log_fn("✖ 已取消更新下载。")
@@ -1431,6 +1444,7 @@ class DownloadProgressDialog(tk.Toplevel):
                     pass
             return
         if error is not None:
+            self._discard_partial(tmp)
             messagebox.showerror("更新失败", "下载新版本失败：%s" % error)
             if self._log_fn:
                 try:
@@ -1452,6 +1466,20 @@ class DownloadProgressDialog(tk.Toplevel):
         except Exception:  # noqa: BLE001
             pass
         self._exit_app()
+
+    def _discard_partial(self, path):
+        """删掉没下完的临时 exe。失败静默（清理是尽力而为，绝不能因此再报错）。"""
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+                if self._log_fn:
+                    try:
+                        self._log_fn("已清理未完成的临时更新文件：%s"
+                                     % os.path.basename(path))
+                    except Exception:
+                        pass
+        except OSError:
+            pass
 
     def _call_install_helper(self, done_path):
         """调用宿主给的安装函数，并带上 cleanup_old。
