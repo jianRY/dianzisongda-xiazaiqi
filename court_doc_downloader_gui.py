@@ -59,7 +59,10 @@ REFERER = "https://zxfw.court.gov.cn/zxfw/"
 MAX_RETRY = 3
 RETRY_BACKOFF = 2.0
 # 版本号标准：三段式 X.Y.Z（项目组 2026-09-27 定）。发版脚本 发版脚本 会校验这个格式。
-VERSION = "2.10.0"
+# ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
+#    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
+#    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
+VERSION = "2.10.2"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -196,6 +199,16 @@ _CASE_RE = re.compile(
 )
 
 
+# 链接末尾可能紧跟的**任何**标点。必须中英文都列全：
+#   法院短信的标准句式就是「…&sdsin=XXX，请及时查阅。」—— 只 strip 英文标点的话，
+#   用户整段粘贴时中文标点会被吞进 sdsin，接口必然校验失败，
+#   弹「链接已过期」让用户以为链接真失效了，白跑一趟。
+# 这一串被同时用在「正则字符类排除」和「rstrip 兜底」两处，形成双重保险。
+_URL_TAIL_CHARS = ".,;:!?)]}>\"'，。；：！？、）】》」』〉〞…—～·　 \t\r\n"
+# 正则里要排除的字符（不能含 `&`、`=`、`#`、`?`，那些是 URL 的合法组成）
+_URL_STOP_CHARS = "\\s\"'<>，。；：！？、（）【】《》「」『』〔〕…—～·"
+
+
 def _extract_one(url, text, pos, case_spans=None):
     """从单个 url 提取参数。
 
@@ -203,9 +216,13 @@ def _extract_one(url, text, pos, case_spans=None):
     优先取「紧跟在该链接之前」的最近案号；没有则回退到全局第一个案号。
     这样批量粘贴多案件时才不会把 B 案的案号安到 A 案头上。
     """
-    q = re.search(r"[?&]qdbh=([^&\s]+)", url)
-    s1 = re.search(r"[?&]sdbh=([^&\s]+)", url)
-    s2 = re.search(r"[?&]sdsin=([^&\s]+)", url)
+    # 参数值用**白名单**取（服务器给的是 Base64 类串），而不是 `[^&\s]+` 黑名单：
+    # 黑名单会漏掉中文标点（链接后常跟「，请及时查阅。」），把正文当成参数值发出去。
+    # 两处保险：外层 extract_tasks 已 strip 过尾部标点，这里再按白名单取一次。
+    p = r"[A-Za-z0-9\-_=+%*~]+"
+    q = re.search(r"[?&]qdbh=(%s)" % p, url)
+    s1 = re.search(r"[?&]sdbh=(%s)" % p, url)
+    s2 = re.search(r"[?&]sdsin=(%s)" % p, url)
     if not (q and s1 and s2):
         return None
     caseno = ""
@@ -241,9 +258,9 @@ def extract_tasks(text):
     # 先扫描全文所有案号及其位置，供 _extract_one 按就近原则配对
     case_spans = [(m.start(), m.end(), m.group(0)) for m in _CASE_RE.finditer(text)]
     case_spans.sort()
-    url_re = re.compile(r"https?://[^\s\"'<>）) ]+")
+    url_re = re.compile(r"https?://[^%s]+" % _URL_STOP_CHARS)
     for m in url_re.finditer(text):
-        url = m.group(0).rstrip(".,;:)%）) ")
+        url = m.group(0).rstrip(_URL_TAIL_CHARS)
         t = _extract_one(url, text, m.start(), case_spans)
         if not t:
             continue
@@ -345,7 +362,10 @@ def download_file(url, path, ctx, cancel_check=None):
                 headers={"User-Agent": BROWSER_UA, "Referer": REFERER, "Accept": "*/*"},
                 method="GET",
             )
-            with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+            # 超时 30s 而不是 120s：这个 urlopen 是**不可中断**的阻塞调用，
+            # 120s 意味着点「取消」后最长要干等 2 分钟才响应（按钮锁死像程序死了）。
+            # 30s 足以区分「网络慢」与「网络断」，失败会自动重试 3 次。
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
                 # 记录服务端声明的长度，下载完比对，防止网络中断留下「文件头正常但内容被截断」的坏 PDF
                 try:
                     expect = int(resp.headers.get("Content-Length", 0) or 0)
@@ -418,6 +438,28 @@ def sanitize_filename(name):
     return name
 
 
+# MIME 类型 → 扩展名。接口的 c_wjgs 字段给的是完整 MIME（如 application/msword），
+# 不查表的话会被压成 "applicationmsword"（超长→判非法）→ 回落 .pdf，
+# 导致 Word/Excel 文书被命名成 .pdf，双击打不开。查不到时再走原来的清洗逻辑。
+_MIME_EXT = {
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/rtf": ".rtf",
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "text/plain": ".txt",
+    "text/html": ".html",
+    "application/json": ".json",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "application/ofd": ".ofd",
+    "application/vnd.ofd": ".ofd",
+    "application/zip": ".zip",
+    "application/octet-stream": "",
+}
+
 def safe_ext(wjgs, url):
     """返回带点的扩展名。
 
@@ -427,14 +469,28 @@ def safe_ext(wjgs, url):
     """
     ext = ""
     if wjgs:
-        cand = re.sub(r"[^A-Za-z0-9]", "", str(wjgs).strip().lstrip("."))
-        if 1 <= len(cand) <= 5:
-            ext = "." + cand.lower()
+        raw = str(wjgs).strip().lower().lstrip(".")
+        # ① 先查 MIME 映射表（application/msword → .doc 这类必须走表，
+        #    压成单词后再判断长度会被误判成非法 → 回落 .pdf，Word 文档就废了）
+        if raw in _MIME_EXT:
+            ext = _MIME_EXT[raw]
+        else:
+            cand = re.sub(r"[^A-Za-z0-9]", "", raw)
+            # ② 形如 "msword"/"openxmlformats-officedocument..." 的长串：取最后一段
+            if len(cand) > 5:
+                cand = cand.split()[-1] if " " in cand else cand
+                # MIME 主类型+子类型压缩后仍过长 → 取尾部有意义的片段
+                for sep in ("officedocument", "formats", "spreadsheetml",
+                            "wordprocessingml", "opendocument"):
+                    if sep in cand:
+                        cand = cand.split(sep)[-1]
+                        break
+            if 1 <= len(cand) <= 5:
+                ext = "." + cand.lower()
     if not ext:
         m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", url or "")
         ext = ("." + m.group(1).lower()) if m else ".pdf"
     return ext
-
 
 def _find_existing_case_dir(base, prefix):
     """在 base 下找「同一案件」已有的文件夹（名 == prefix 或 prefix_时间戳），取最近修改的。
@@ -656,6 +712,7 @@ class App:
         self.running = False
         self.stop_event = threading.Event()  # 取消下载信号
         self._cancel_lock = threading.Lock()  # 保护 last_case_dir / 计数等共享状态
+        self._path_save_job = None           # 路径框防抖的待执行 after 句柄
         # ⚠️ 界面更新一律走这条队列，worker 线程绝不直接碰 Tk —— 见 _post / _pump 注释
         self._ui_queue = queue.Queue()
         self._pump_job = None
@@ -974,9 +1031,18 @@ class App:
 
     def _on_path_var_changed(self, *_):
         val = self.path_var.get().strip()
-        if val:
-            self.out_dir = val
-            self._save_cfg()
+        if not val:
+            return
+        self.out_dir = val
+        # ⚠️ 防抖：trace 是每次击键都触发，用户粘贴一段长路径会连着写几十次
+        #    磁盘（open + json.dump）。慢盘/网络盘上会明显卡输入。
+        #    这里只重排一次延迟保存，停止输入 400ms 后才真正落盘。
+        try:
+            if self._path_save_job:
+                self.root.after_cancel(self._path_save_job)
+        except Exception:  # noqa: BLE001
+            pass
+        self._path_save_job = self.root.after(400, self._save_cfg)
 
     def _on_auto_open_changed(self, *_):
         self.auto_open_mode = int(self.auto_open_var.get())
@@ -1295,8 +1361,10 @@ class App:
         if not tasks:
             messagebox.showwarning("无法识别", "未能从文本中提取到送达链接（需含 qdbh/sdbh/sdsin）。")
             return
-        # 重置取消标志
-        self.stop_event.clear()
+        # 重置取消标志（加锁：与 worker 收尾时的 clear() 互斥，
+        # 否则上一轮的延迟清理可能把本轮的取消标志清掉）
+        with self._cancel_lock:
+            self.stop_event.clear()
         self.btn_start.configure_state(state="normal", text="取消下载", command=self.on_cancel)
         # ⚠️ running 必须在按钮切换「成功之后」才置 True。反过来写的话，一旦界面操作
         #    抛异常，running 已经为 True，用户再点按钮会被 `if self.running: return` 挡掉，
@@ -1317,7 +1385,9 @@ class App:
         ):
             self.stop_event.set()
             self.log_msg("⏸ 收到取消请求，正在停止剩余任务…")
-            self.btn_start.configure_state(state="disabled", text="正在取消…")
+            # 明确告知最坏等待时间：urlopen 是阻塞调用，取消最多要等一个超时周期
+            # （已降到 30s）才生效。说清楚用户才不会以为程序死了而强杀（强杀会留半截 PDF）。
+            self.btn_start.configure_state(state="disabled", text="正在取消…（最多等 30 秒）")
 
     def on_close(self):
         """关闭窗口：下载中先确认，并让 worker 有机会清理半成品文件。"""
@@ -1364,6 +1434,7 @@ class App:
         ctx = ssl.create_default_context()
         total_ok = 0
         total_all = 0
+        total_skip = 0   # 已存在而跳过的份数（不计入成功）
         done_count = 0
         total_docs = 0
         cancelled = False
@@ -1497,6 +1568,7 @@ class App:
                         return (i_, raw_, "fail", "    ✗ 失败：%s" % e, full_)
 
                 success = 0
+                skipped = 0
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
                     futures = {ex.submit(_do_one, j): j for j in jobs}
                     for fut in as_completed(futures):
@@ -1511,7 +1583,10 @@ class App:
                         if status == "ok":
                             success += 1
                         elif status == "skip":
-                            success += 1  # 已存在视为成功，不计入失败
+                            # ⚠️ 跳过**不等于下载成功**：单独计数，否则「勾了跳过已存在
+                            #    + 文件全都已下过」时，会弹出「108 份文书已下载」而实际一份
+                            #    都没下 —— 这正是 v2.6「下载失败却提示成功」那类坑的变种。
+                            skipped += 1
                         elif status == "cancelled":
                             # 已取消：剩余 future 还在跑，等它们自己看到 stop_event 退出
                             pass
@@ -1525,8 +1600,12 @@ class App:
                             cancelled = True
 
                 total_ok += success
+                total_skip += skipped
                 total_all += len(docs)
-                self.log_msg("--- 本案完成：%d / %d 份 ---" % (success, len(docs)))
+                if skipped and not success:
+                    self.log_msg("--- 本案完成：全部 %d 份均已存在，无需下载 ---" % skipped)
+                else:
+                    self.log_msg("--- 本案完成：%d / %d 份 ---" % (success, len(docs)))
 
                 # 模式：打开每个案件文件夹
                 if self.auto_open_mode == AUTO_OPEN_EACH and not cancelled:
@@ -1545,8 +1624,8 @@ class App:
                     "已取消", "下载已取消。成功 %d / %d 份，详见日志。" % (ok, al)))
             else:
                 self.log_msg("")
-                self.log_msg("=== 全部完成：成功 %d / %d 份（共 %d 个链接，%d 个未取到清单）==="
-                             % (total_ok, total_all, len(tasks), failed_cases))
+                self.log_msg("=== 全部完成：成功 %d / %d 份（跳过 %d 份已存在，共 %d 个链接，%d 个未取到清单）==="
+                             % (total_ok, total_all, total_skip, len(tasks), failed_cases))
                 if total_all == 0:
                     # ⚠️ 一份都没拿到时必须报错，绝不能提示「下载完成」——
                     #    旧版正是在这里骗了用户：链接全过期 → 弹「下载完成」→ 桌面空空。
@@ -1559,16 +1638,26 @@ class App:
                         "· 若提示「链接过期 / 校验失败」→ 请重新获取送达短信后再试\n"
                         "· 若是网络类错误 → 程序已自动重试 3 次仍失败，请检查网络\n\n"
                         "完整日志已保存到：\n%s" % (n, le or "（未捕获到具体原因，见日志）", ld)))
-                elif failed_cases or total_ok < total_all:
+                elif failed_cases or total_ok + total_skip < total_all:
                     self._ui(lambda ok=total_ok, al=total_all, fc=failed_cases,
-                                    le=last_error: messagebox.showwarning(
+                                    sk=total_skip, le=last_error: messagebox.showwarning(
                                  "部分完成",
-                                 "成功 %d / %d 份文书；另有 %d 个链接未能获取清单。\n\n"
+                                 "成功 %d / %d 份文书%s；另有 %d 个链接未能获取清单。\n\n"
                                  "失败原因：%s\n\n详见日志。"
-                                 % (ok, al, fc, le or "见日志")))
+                                 % (ok, al,
+                                    ("，%d 份已存在被跳过" % sk) if sk else "",
+                                    fc, le or "见日志")))
+                elif total_ok == 0 and total_skip > 0:
+                    # ⚠️ 全是「已存在跳过」时不能说「已下载」—— 一份都没下。
+                    #    这是 v2.6「假成功提示」的同类问题，弹错会让用户以为下过了。
+                    self._ui(lambda n=len(tasks), sk=total_skip: messagebox.showinfo(
+                        "无需下载", "全部 %d 份文书均已存在，本次未重复下载。\n\n"
+                        "%d 个案件文件夹，内容完好。" % (sk, n)))
                 else:
-                    self._ui(lambda n=len(tasks), ok=total_ok: messagebox.showinfo(
-                        "下载完成", "全部 %d 个案件、%d 份文书已下载。" % (n, ok)))
+                    extra = ("，%d 份已存在被跳过" % total_skip) if total_skip else ""
+                    self._ui(lambda n=len(tasks), ok=total_ok, sk=total_skip:
+                             messagebox.showinfo(
+                        "下载完成", "全部 %d 个案件、%d 份文书已下载%s。" % (n, ok, extra)))
                 # 自动打开保存位置：一个案件文件夹都没建起来时（链接全失效），
                 # 也要按设置打开根目录，否则用户看到的是「点了下载毫无反应」。
                 if self.auto_open_mode == AUTO_OPEN_ROOT:
@@ -1587,8 +1676,14 @@ class App:
         finally:
             # ⚠️ 收尾动作全部走 _ui()：窗口可能已被用户关掉（_force_close 已 destroy），
             #    此时直接调 self.root.after 会抛 TclError，把 worker 线程弄崩。
-            self.running = False
-            self.stop_event.clear()
+            with self._cancel_lock:
+                self.running = False
+                # stop_event 是全局唯一的取消标志。这里的 clear() 与按钮复位之间
+                # 隔着一次主线程队列投递（按钮复位要等队列被泵执行），期间用户可能
+                # 看着「正在取消…」又点了按钮 → on_start 发现 running 已是 False
+                # → 启动新下载。若这之后再有人 clear 一次，新下载的取消标志就被清掉了。
+                # 所以先取锁、并把「已收尾」状态与清标志绑在同一个临界区里。
+                self.stop_event.clear()
             self._ui(lambda: self.btn_start.configure_state(
                 state="normal", text="开始下载", command=self.on_start))
 

@@ -61,11 +61,24 @@ def log(msg):
 
 
 # ---------- 1. 解析输入 ----------
+# 参数值的合法字符集：服务器给的是 Base64 类串（字母数字 + `-` `_` `=`），
+# 但用户粘贴整段短信时结尾常跟中文标点（`&sdsin=XXX，请及时查阅。`）。
+# 不把标点切掉就会把「，请及时查阅。」当成参数值发出去 → 接口校验失败。
+# 所以这里显式定义「允许集」，用白名单而不是逐个排除（漏一个就又是一次线上事故）。
+_P_VAL = r"[A-Za-z0-9\-_=+%*~]"      # 参数值允许的字符
+_TAIL_STRIP = ".,;:!?)]}>\"'，。；：！？、）】》」』〉〞…—～·　 \t\r\n"
+
+
+def _clean_val(m):
+    """把匹配到的参数值右侧的标点/空白切掉。"""
+    return m.group(1).rstrip(_TAIL_STRIP)
+
+
 def parse_params(text):
     """从链接或整段短信里提取 qdbh / sdbh / sdsin，以及案号。"""
-    qdbh = re.search(r"[?&]qdbh=([^&\s]+)", text)
-    sdbh = re.search(r"[?&]sdbh=([^&\s]+)", text)
-    sdsin = re.search(r"[?&]sdsin=([^&\s]+)", text)
+    qdbh = re.search(r"[?&]qdbh=(%s+)" % _P_VAL, text)
+    sdbh = re.search(r"[?&]sdbh=(%s+)" % _P_VAL, text)
+    sdsin = re.search(r"[?&]sdsin=(%s+)" % _P_VAL, text)
     if not (qdbh and sdbh and sdsin):
         return None
     # 顺便尝试从短信正文里抠出标准案号，例如 (2025)苏0000民初1234号
@@ -80,9 +93,9 @@ def parse_params(text):
     )
     caseno = m.group(0) if m else ""
     return {
-        "qdbh": qdbh.group(1),
-        "sdbh": sdbh.group(1),
-        "sdsin": sdsin.group(1),
+        "qdbh": _clean_val(qdbh),
+        "sdbh": _clean_val(sdbh),
+        "sdsin": _clean_val(sdsin),
         "caseno": caseno,
     }
 
@@ -218,20 +231,60 @@ def sanitize_filename(name):
     return name
 
 
+# MIME 类型 → 扩展名。接口的 c_wjgs 字段给的是完整 MIME（如 application/msword），
+# 不查表的话会被压成 "applicationmsword"（超长→判非法）→ 回落 .pdf，
+# 导致 Word/Excel 文书被命名成 .pdf，双击打不开。查不到时再走原来的清洗逻辑。
+_MIME_EXT = {
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/rtf": ".rtf",
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "text/plain": ".txt",
+    "text/html": ".html",
+    "application/json": ".json",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "application/ofd": ".ofd",
+    "application/vnd.ofd": ".ofd",
+    "application/zip": ".zip",
+    "application/octet-stream": "",
+}
+
 def safe_ext(wjgs, url):
-    """返回带点的扩展名；c_wjgs 可能是 'pdf' / '.PDF' / 'application/pdf'，需清洗。"""
+    """返回带点的扩展名。
+
+    c_wjgs 可能是 'pdf' / '.PDF' / 'application/pdf' 等形态，统一清洗成小写扩展名；
+    清洗不出合法扩展名时再从 URL 猜，最后兜底 .pdf。
+    旧实现直接拼 '.'+c_wjgs，遇到 'application/pdf' 会得到非法文件名。
+    """
     ext = ""
     if wjgs:
-        cand = re.sub(r"[^A-Za-z0-9]", "", str(wjgs).strip().lstrip("."))
-        if 1 <= len(cand) <= 5:
-            ext = "." + cand.lower()
+        raw = str(wjgs).strip().lower().lstrip(".")
+        # ① 先查 MIME 映射表（application/msword → .doc 这类必须走表，
+        #    压成单词后再判断长度会被误判成非法 → 回落 .pdf，Word 文档就废了）
+        if raw in _MIME_EXT:
+            ext = _MIME_EXT[raw]
+        else:
+            cand = re.sub(r"[^A-Za-z0-9]", "", raw)
+            # ② 形如 "msword"/"openxmlformats-officedocument..." 的长串：取最后一段
+            if len(cand) > 5:
+                cand = cand.split()[-1] if " " in cand else cand
+                # MIME 主类型+子类型压缩后仍过长 → 取尾部有意义的片段
+                for sep in ("officedocument", "formats", "spreadsheetml",
+                            "wordprocessingml", "opendocument"):
+                    if sep in cand:
+                        cand = cand.split(sep)[-1]
+                        break
+            if 1 <= len(cand) <= 5:
+                ext = "." + cand.lower()
     if not ext:
         m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", url or "")
         ext = ("." + m.group(1).lower()) if m else ".pdf"
     return ext
 
-
-# ---------- 主流程 ----------
 def main():
     parser = argparse.ArgumentParser(description="法院电子送达文书下载工具")
     parser.add_argument("text", nargs="*", help="送达链接或整段短信（可省略进入交互模式）")
