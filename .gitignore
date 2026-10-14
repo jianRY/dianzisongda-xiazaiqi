@@ -53,3 +53,7 @@ id_rsa
 id_ed25519
 .netrc
 .git-credentials
+
+# 例外：随程序分发的**公共** CA 证书（非私钥，公开信息，必须入库才能打包）
+# 用 .crt 扩展名（证书的标准扩展名），避免与私钥类 *.pem 规则混淆。
+!assets/ca/*.crt
