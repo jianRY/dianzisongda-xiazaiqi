@@ -45,6 +45,14 @@ import time
 import urllib.error
 import urllib.request
 
+# 信任库构造：系统库 + 随包内置公共 CA。
+# 本脚本号称「零依赖」，故做成可选导入 —— 缺失时退化为仅系统库（行为与旧版一致），
+# 不会因为少一个文件而直接跑不起来。
+try:
+    import ssl_trust
+except ImportError:  # pragma: no cover
+    ssl_trust = None
+
 # ---- 配置 ----
 API_URL = "https://zxfw.court.gov.cn/yzw/yzw-zxfw-sdfw/api/v1/sdfw/getWsListBySdbhNew"
 BROWSER_UA = (
@@ -297,6 +305,8 @@ def main():
     parser.add_argument("text", nargs="*", help="送达链接或整段短信（可省略进入交互模式）")
     parser.add_argument("--out", default="./法院文书", help="下载根目录（默认 ./法院文书）")
     parser.add_argument("--no-verify", action="store_true", help="关闭 SSL 证书校验")
+    parser.add_argument("--verbose", action="store_true",
+                        help="输出证书信任库加载详情（排查 SSL 校验失败时用）")
     args = parser.parse_args()
 
     # 取输入文本
@@ -317,17 +327,30 @@ def main():
         sys.exit(1)
     log("✓ 已解析参数：qdbh=%s  sdbh=%s  sdsin=%s" % (params["qdbh"], params["sdbh"], params["sdsin"]))
 
-    ctx = ssl.create_default_context()
-    if args.no_verify:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    # 信任库 = 系统库 + 随包内置的公共 CA（叠加，不替换）。
+    # 不能只用 ssl.create_default_context()：它只读系统库，新装系统常缺
+    # 法院站点需要的根证书，会直接报 CERTIFICATE_VERIFY_FAILED。
+    if ssl_trust is not None:
+        ctx, _info = ssl_trust.build_ssl_context(verify=not args.no_verify,
+                                                 log_fn=log if args.verbose else None)
+    else:
+        ctx = ssl.create_default_context()
+        if args.no_verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
     # 取清单
     log("→ 正在向送达平台请求文书清单…")
     try:
         docs = fetch_doc_list(params, ctx)
     except Exception as e:  # noqa: BLE001
-        log("✗ 获取文书清单失败：%s" % e)
+        hint = ssl_trust.describe_cert_error(e) if ssl_trust is not None else None
+        if hint:
+            log("✗ 安全连接校验失败：")
+            for line in hint.splitlines():
+                log("   " + line)
+        else:
+            log("✗ 获取文书清单失败：%s" % e)
         sys.exit(1)
     log("✓ 共找到 %d 份文书" % len(docs))
 

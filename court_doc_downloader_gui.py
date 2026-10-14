@@ -49,6 +49,7 @@ import urllib.error
 import urllib.request
 
 import autoupdate
+import ssl_trust
 
 API_URL = "https://zxfw.court.gov.cn/yzw/yzw-zxfw-sdfw/api/v1/sdfw/getWsListBySdbhNew"
 BROWSER_UA = (
@@ -62,7 +63,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -1447,7 +1448,11 @@ class App:
         self._post(fn)
 
     def worker(self, tasks):
-        ctx = ssl.create_default_context()
+        # 信任库 = 系统库 + 随包内置的公共 CA（叠加，不替换）。
+        # ⚠️ 不能再用裸 ssl.create_default_context()：它只读系统库，
+        #    新装 Windows 常缺法院站点所需的根证书（CFCA EV ROOT），
+        #    请求清单时会直接报 CERTIFICATE_VERIFY_FAILED（详见 ssl_trust.py）。
+        ctx, _ssl_info = ssl_trust.build_ssl_context(log_fn=self.log_msg)
         total_ok = 0
         total_all = 0
         total_skip = 0   # 已存在而跳过的份数（不计入成功）
@@ -1490,9 +1495,18 @@ class App:
                             % (n, _safe_text(err).strip() or type(err).__name__)))
                 except Exception as e:  # noqa: BLE001
                     failed_cases += 1
-                    last_error = _safe_text(e).strip() or type(e).__name__
-                    self.log_msg("✗ 获取清单失败：%s" % last_error)
-                    self.log_msg("   该链接未能取到文书清单，已跳过（链接多半已过期）。")
+                    # 证书类错误单独翻成人话：新电脑缺根证书时报的原始英文错误
+                    # 用户完全看不懂，会误以为「程序坏了」或「链接过期」。
+                    ssl_hint = ssl_trust.describe_cert_error(e)
+                    if ssl_hint:
+                        last_error = ssl_hint
+                        self.log_msg("✗ 安全连接校验失败（不是链接过期，别去重新取短信）")
+                        for line in ssl_hint.splitlines():
+                            self.log_msg("   " + line)
+                    else:
+                        last_error = _safe_text(e).strip() or type(e).__name__
+                        self.log_msg("✗ 获取清单失败：%s" % last_error)
+                        self.log_msg("   该链接未能取到文书清单，已跳过（链接多半已过期）。")
                     continue
                 self.log_msg("✓ 找到 %d 份文书" % len(docs))
                 total_docs += len(docs)
@@ -1712,6 +1726,17 @@ def main():
     write_log_file("启动 法院文书下载器 v%s | Python %s | frozen=%s | 日志目录 %s"
                    % (VERSION, sys.version.split()[0], bool(getattr(sys, "frozen", False)),
                       log_dir()))
+    # 内置 CA 的加载结果写进日志：这是「证书类故障」的第一手线索。
+    # 用户报 SSL 错误时，让日志直接说明内置证书到底有没有加载上，
+    # 不用再去猜是打包漏了文件、还是环境真的缺根证书。
+    try:
+        _ctx, _info = ssl_trust.build_ssl_context()
+        write_log_file("内置CA 目录=%s | 文件=%s | 已加载=%s | 失败=%s | 信任库 %s→%s 张"
+                       % (os.path.join(ssl_trust.base_dir(), ssl_trust.CA_SUBDIR),
+                          _info["files"], _info["loaded"],
+                          _info["failed"] or "无", _info.get("total"), _info.get("total_after")))
+    except Exception as e:  # noqa: BLE001
+        write_log_file("内置CA 加载异常：%s" % _safe_text(e))
     root = tk.Tk()
     App(root)
     root.mainloop()

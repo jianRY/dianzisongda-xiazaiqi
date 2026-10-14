@@ -65,6 +65,31 @@ from tkinter import messagebox, scrolledtext, ttk
 import urllib.error
 import urllib.request
 
+# 信任库构造：系统库 + 随包内置公共 CA（叠加，不替换）。
+# ⚠️ 本模块是**跨项目复用**的，别的项目可能没有 ssl_trust.py，
+#    所以做成可选导入：缺失时退化为仅系统库（与旧行为一致），不影响使用。
+# 为什么必须改：新装 Windows 常缺公共根证书（如 CFCA），
+#    直接用 urlopen 不带 context 只能读系统库 → 检查更新/下载更新会报
+#    CERTIFICATE_VERIFY_FAILED（与主程序访问法院站点是同一个根因）。
+try:
+    import ssl_trust
+except ImportError:  # pragma: no cover
+    ssl_trust = None
+
+_SSL_CTX = None
+
+
+def _ssl_context():
+    """惰性构造并缓存 SSLContext（避免每次请求都重读证书库）。"""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        if ssl_trust is not None:
+            _SSL_CTX = ssl_trust.build_ssl_context()[0]
+        else:
+            import ssl
+            _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -195,7 +220,8 @@ def probe_speed(url, nbytes=PROBE_BYTES, timeout=PROBE_TIMEOUT):
     try:
         t0 = time.monotonic()
         n = 0
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_ssl_context()) as resp:
             while n < nbytes:
                 buf = resp.read(65536)
                 if not buf:
@@ -390,7 +416,8 @@ def fetch_latest_release(api_url, timeout=15):
         headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_ssl_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     dl = None
     for a in data.get("assets", []):
@@ -415,7 +442,8 @@ def fetch_latest_release(api_url, timeout=15):
 def _http_json(url, timeout=8):
     req = urllib.request.Request(
         url, headers={"User-Agent": UA, "Accept": "application/json"}, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -1268,7 +1296,8 @@ class DownloadProgressDialog(tk.Toplevel):
         if done > 0:
             headers["Range"] = "bytes=%d-" % done
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=_ssl_context()) as resp:
             status = getattr(resp, "status", 200)
             if done > 0 and status != 206:
                 # 该源不支持断点续传（或忽略了 Range）→ 只能从头下
