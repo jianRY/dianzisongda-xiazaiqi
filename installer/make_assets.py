@@ -20,7 +20,9 @@ OUTDIR = os.path.join(ROOT, "installer")
 CACHE_ISL = os.path.join(ROOT, ".pybuild_cache", "installer", "ChineseSimplified.isl")
 ISL_URL = ("https://raw.githubusercontent.com/kira-96/"
            "Inno-Setup-Chinese-Simplified-Translation/main/ChineseSimplified.isl")
-PROXY = "http://127.0.0.1:10808"
+# 代理从环境取，不写死本机端口（曾在仓库里硬编码 127.0.0.1:10808，属于本机专属配置）。
+# 需要代理时设 HTTPS_PROXY；不设就走直连。
+PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 
 NAVY_TOP = (16, 46, 82)
 NAVY_BOTTOM = (6, 20, 40)

@@ -8,7 +8,7 @@
 
 全国法院统一送达平台电子送达文书自动下载工具。粘贴送达短信或链接，自动提取该案件全部文书并下载为 PDF，支持**多线程并发下载**、批量、转 JPG、防合并命名、自动更新（含更新内容展示 / 三选项 / 进度速度 / 随时取消）。
 
-## 功能特性（v2.11.1）
+## 功能特性（v2.11.2）
 
 - 自动识别 `zxfw.court.gov.cn` 送达链接（支持整段短信 / 一次粘贴多个链接批量下载）
 - **容错粘贴**：链接后面跟中文标点（`，。；：？！【】「」` 等）也能正确识别参数 —— 法院短信的标准句式就是「……&sdsin=XXX，请及时查阅。」，直接整段粘贴即可
@@ -65,7 +65,7 @@ python court_doc_downloader_gui.py
 pip install pyinstaller pymupdf
 
 # 先生成版本资源（PyInstaller 会把这个文件当 Python 源码 eval，格式必须对）
-python .pybuild_cache/make_version_file.py 2.11.1 法院文书下载器 version_info.txt
+python .pybuild_cache/make_version_file.py 2.11.2 法院文书下载器 version_info.txt
 
 pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
   --exclude-module numpy --exclude-module PIL \
@@ -81,8 +81,8 @@ pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
 **安装包**（需先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)）：
 
 ```bash
-python installer/make_assets.py 2.11.1    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
-ISCC.exe installer.iss /DAppVersion=2.11.1 /DSrcExe="dist\法院文书下载器_v2.11.1.exe"
+python installer/make_assets.py 2.11.2    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
+ISCC.exe installer.iss /DAppVersion=2.11.2 /DSrcExe="dist\法院文书下载器_v2.11.2.exe"
 ```
 
 `installer.iss` **不再提供默认版本号**（写死的默认值会让「忘记传参」变成静默的错误版本），漏传 `/DAppVersion` 会直接编译失败。
@@ -91,7 +91,7 @@ ISCC.exe installer.iss /DAppVersion=2.11.1 /DSrcExe="dist\法院文书下载器_
 
 | 文件                            | 说明                               |
 | ----------------------------- | -------------------------------- |
-| `court_doc_downloader_gui.py` | 图形界面主程序（v2.11.1）                 |
+| `court_doc_downloader_gui.py` | 图形界面主程序（v2.11.2）                 |
 | `autoupdate.py`               | 通用自动更新模块（三行接入，可复用到其他 Tkinter 软件） |
 | `court_doc_downloader.py`     | 命令行版（零依赖，仅标准库 urllib）            |
 | `ui_kit.py`                   | 自绘控件库（圆角按钮 / 复选框 / 分段控件 / 进度条 / 日志视图） |

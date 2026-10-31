@@ -33,6 +33,9 @@ import os
 import queue
 import re
 import ssl
+import glob
+import hashlib
+import io
 import subprocess
 import sys
 import threading
@@ -46,6 +49,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import autoupdate
@@ -63,7 +67,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.11.1"
+VERSION = "2.11.2"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -84,11 +88,66 @@ APP_ID = "jianRY.CourtDocDownloader"
 # 用户能看到的就只有「点了没反应」——曾经因此排查了两天。落盘后任何异常都留痕。
 _LOG_LOCK = threading.Lock()
 
+# 日志里绝不能出现送达链接的查询串：qdbh/sdbh/sdsin 这三元组是**免登录**访问
+# 当事人全部文书的凭证。日志落到 %LOCALAPPDATA% 后会被用户整份发给技术支持，
+# 等于把案件材料一并交出去（实测日志里确实出现过完整 sdsin）。
+# 原则：日志只需要能区分「是不是同一条链接」，不需要能复原它。
+_REDACT_KEYS = ("sdsin", "sdbh", "qdbh", "sid", "token", "access_token",
+                "access_key", "key", "sign", "signature")
+_REDACT_RE = re.compile(r"(?i)\b(%s)=([^&\s#\"'<>]+)" % "|".join(_REDACT_KEYS))
+
+
+def redact_text(s):
+    """把文本里的送达凭证打码：保留参数名与前 3 位，便于比对是否同一条链接。"""
+    try:
+        def _sub(m):
+            return "%s=%s***" % (m.group(1), m.group(2)[:3])
+        return _REDACT_RE.sub(_sub, str(s))
+    except Exception:
+        return str(s)
+
+
+def url_fingerprint(url):
+    """链接 → 不可复原的指纹「域名 (#摘要前8位)」。
+
+    排查「链接是否过期 / 两次是不是同一条」够用，但拿着它访问不了任何文书。
+    """
+    u = str(url or "").strip()
+    if not u:
+        return "（空）"
+    try:
+        host = urllib.parse.urlsplit(u).netloc or "链接"
+    except Exception:  # noqa: BLE001
+        host = "链接"
+    return "%s (#%s)" % (host, hashlib.sha256(u.encode("utf-8", "replace")).hexdigest()[:8])
+
 
 def log_dir():
     """日志目录：%LOCALAPPDATA%\\法院文书下载器\\日志。"""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "法院文书下载器", "日志")
+
+
+def prune_logs(keep_days=30):
+    """删除超过保留期的运行日志。
+
+    日志里可能残留案件访问凭证与文书信息，不能无限期堆在磁盘上。
+    只删本程序自己的 运行日志_YYYYMMDD.log，任何失败都静默。
+    """
+    try:
+        cutoff = time.time() - keep_days * 86400
+        d = log_dir()
+        for name in os.listdir(d):
+            if not (name.startswith("运行日志_") and name.endswith(".log")):
+                continue
+            p = os.path.join(d, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _safe_text(s):
@@ -97,10 +156,14 @@ def _safe_text(s):
     Tk 遇到孤立代理字符（surrogate）或 NUL 会直接抛异常 —— 一旦异常发生在
     「记录错误」这一步，真正的错误信息就会被吞掉（正是 v2.6 以前的坑）。
     这里统一做清洗，保证日志永远不会因为内容而写不出去。
+
+    最后再做一次凭证脱敏：本函数是所有日志（界面 / 落盘 / 退出改名 / 异常兜底）
+    的公共入口，在这里做等于全路径覆盖，不用逐个调用点去改。
     """
     try:
         t = str(s).replace("\x00", "")
-        return t.encode("utf-8", "replace").decode("utf-8", "replace")
+        t = t.encode("utf-8", "replace").decode("utf-8", "replace")
+        return redact_text(t)
     except Exception:
         return repr(s)
 
@@ -122,7 +185,9 @@ def write_log_file(line):
             except OSError:
                 pass
             with open(p, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+                # 二道保险：直接调 write_log_file 的地方（traceback / 界面异常）
+                # 不经过 _safe_text，在这里统一脱敏，保证落盘内容永远不含送达凭证。
+                f.write(redact_text(line) + "\n")
     except Exception:
         pass
 
@@ -1210,6 +1275,7 @@ class App:
         # 帮助菜单
         m_help = tk.Menu(menubar, tearoff=0)
         m_help.add_command(label="使用说明", command=self.show_help)
+        m_help.add_command(label="导出诊断日志（已脱敏）", command=self.export_diag_log)
         m_help.add_separator()
         m_help.add_command(label="关于", command=self.show_about)
         menubar.add_cascade(label="帮助", menu=m_help)
@@ -1290,6 +1356,44 @@ class App:
         txt.configure(state="disabled")
         K.RoundButton(win, text="关闭", command=win.destroy, kind="ghost",
                       height=32, font_size=9, width=72).pack(pady=(K.u(10), K.u(12)))
+
+    def export_diag_log(self):
+        """把最近几天的日志脱敏后另存，供用户发给技术支持。
+
+        为什么需要这个：用户报障时通常直接把整个日志目录打包发出去，而日志里有
+        案件信息。这里产出的副本会去掉送达凭证与文书文件名，只剩时间线与错误原因 ——
+        够定位问题，但拿到它也开不了别人的案子。
+        """
+        try:
+            d = log_dir()
+            files = sorted(glob.glob(os.path.join(d, "运行日志_*.log")))[-3:]
+            if not files:
+                messagebox.showinfo("导出诊断日志", "还没有日志可以导出。")
+                return
+            chunks = []
+            for p in files:
+                try:
+                    chunks.append(io.open(p, "r", encoding="utf-8", errors="replace").read())
+                except OSError:
+                    pass
+            if not chunks:
+                messagebox.showinfo("导出诊断日志", "日志文件读不出来，可能已被清理。")
+                return
+            text = redact_text("\n".join(chunks))
+            # 文书文件名也隐去：有些文书名直接含当事人姓名
+            text = re.sub(r"(已保存：)[^\s(]+", r"\1（文件名已隐藏）", text)
+            text = re.sub(r"(已存在，跳过：)[^\s]+", r"\1（文件名已隐藏）", text)
+            text = re.sub(r"(下载失败：)[^\s]+\.(pdf|docx?|xlsx?|ofd|jpe?g|png)",
+                          r"\1（文件名已隐藏）.\2", text, flags=re.I)
+            out = os.path.join(get_desktop(), "诊断日志_%s.txt" % time.strftime("%Y%m%d_%H%M%S"))
+            with io.open(out, "w", encoding="utf-8") as f:
+                f.write(text)
+            messagebox.showinfo(
+                "导出诊断日志",
+                "已导出脱敏后的日志：\n%s\n\n"
+                "文件里已去除链接访问凭证与文书文件名，可以直接发给技术支持。" % out)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("导出诊断日志", "导出失败：%s" % e)
 
     def show_about(self):
         messagebox.showinfo(
@@ -1482,7 +1586,9 @@ class App:
                     break
                 self.log_msg("")
                 self.log_msg("==== 案件 %d / %d ====" % (idx, len(tasks)))
-                self.log_msg("链接：%s" % params.get("url", ""))
+                # 只落指纹，不落原链接：qdbh/sdbh/sdsin 是免登录下载全部文书的凭证。
+                # 指纹足以判断「是不是同一条链接、会不会过期」，但拿着它打不开任何文书。
+                self.log_msg("链接：%s" % url_fingerprint(params.get("url", "")))
                 # 取清单要联网，慢的时候界面会有几秒没动静；先给一行可见反馈，
                 # 免得用户以为卡死了（v2.10.0 起）。正常情况这条几乎瞬间就被下一行顶掉。
                 self.log_msg("⏳ 正在连接法院平台获取文书清单…")
@@ -1574,7 +1680,10 @@ class App:
                             except Exception as e2:  # noqa: BLE001
                                 msg += "  ✗ 转 JPG 失败：%s" % e2
                         return (i_, raw_, "skip", msg, full_)
-                    self.log_msg("[%d/%d] 下载：%s" % (i_, len(docs), raw_))
+                    # 流水行不再打印文书名：日志可能被整份外发，而文书名有时直接
+                    # 含当事人姓名（「XX 与 YY 民间借贷纠纷判决书」）。序号 + 进度条
+                    # 已经说明进度，具体是哪份，看下载完的文件夹即可。
+                    self.log_msg("[%d/%d] 下载中" % (i_, len(docs)))
                     try:
                         download_file(
                             d_.get("wjlj"), full_, ctx,
@@ -1667,7 +1776,9 @@ class App:
                         "失败原因：\n%s\n\n"
                         "· 若提示「链接过期 / 校验失败」→ 请重新获取送达短信后再试\n"
                         "· 若是网络类错误 → 程序已自动重试 3 次仍失败，请检查网络\n\n"
-                        "完整日志已保存到：\n%s" % (n, le or "（未捕获到具体原因，见日志）", ld)))
+                        "完整日志已保存到：\n%s\n\n"
+                        "（日志已自动去除链接中的访问凭证；如仍需发送，"
+                        "建议先看一眼内容）" % (n, le or "（未捕获到具体原因，见日志）", ld)))
                 elif failed_cases or total_ok + total_skip < total_all:
                     self._ui(lambda ok=total_ok, al=total_all, fc=failed_cases,
                                     sk=total_skip, le=last_error: messagebox.showwarning(
@@ -1720,6 +1831,8 @@ class App:
 
 def main():
     setup_app_id()
+    # 启动时清掉过期日志：日志里可能留着历史案件信息，不能无限期堆着
+    prune_logs(30)
     # 每次运行在日志里留下抬头，出问题时一眼能看出是哪次、什么版本、什么环境
     write_log_file("")
     write_log_file("=" * 56)
@@ -1737,6 +1850,13 @@ def main():
                           _info["failed"] or "无", _info.get("total"), _info.get("total_after")))
     except Exception as e:  # noqa: BLE001
         write_log_file("内置CA 加载异常：%s" % _safe_text(e))
+    # 更新源（只写域名）：备用源为空 = _endpoints.py 没打进包。
+    # 用户反馈「检查更新慢/失败」时，这条能一眼区分是网络问题还是打包漏了配置。
+    try:
+        _site = getattr(autoupdate, "_site_base", lambda: "")()
+        write_log_file("更新源：GitHub 原站 / 备用源 %s" % (_site or "（未配置）"))
+    except Exception:  # noqa: BLE001
+        pass
     root = tk.Tk()
     App(root)
     root.mainloop()

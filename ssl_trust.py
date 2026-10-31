@@ -34,16 +34,43 @@
 证书均为**公开的公共 CA 证书**，不含任何私钥或隐私信息。
 """
 
+import hashlib
 import os
 import ssl
 import sys
 
 # 内置证书目录（相对包根，兼容 PyInstaller onefile 的 sys._MEIPASS）
 CA_SUBDIR = os.path.join("assets", "ca")
-# 认定哪些扩展名是证书文件。
-# ⚠️ 同时收 .pem 是为了向后兼容（若有人沿用旧命名也能加载）；
-#    实际随包发布的是 .crt。
+# 历史常量，保留以兼容外部引用；加载逻辑已改为下面的固定清单，不再按扩展名扫描。
 CA_EXTS = (".crt", ".cer", ".pem")
+
+# 内置证书的**固定清单**：文件名 + 内容哈希。
+#
+# 为什么不能扫目录（2026-10-31 安全审查）：早期实现是 os.listdir 取 assets/ca/
+# 下所有 *.crt/*.cer/*.pem 全部 load_verify_locations。那等于「目录里放了什么就
+# 信任什么」——程序目录（绿色版所在位置、打包后的 _MEIPASS 解包目录）当前用户
+# 可写，投放一张自签根即可让本进程后续所有 HTTPS（含更新下载）被解密替换。
+# 现在只认这三个名字，且内容哈希必须与发布时一致，否则跳过并写日志。
+#
+# ⚠️ 换证书 / 升级 ca-bundle 时必须同步更新这里的哈希，否则该证书会被跳过
+#    （日志里会出现「内容与预期不一致」）。这是刻意设计，不是 bug。
+BUILTIN_CA = (
+    ("cfca_ev_root.crt", "4da4140976f6c2b38f960e149fb4a374a9a6c1bf29279d80a8fc285881e62313"),
+    ("cfca_ov_oca.crt",  "5fea95256174aa650ca1376e6251a9ab5ca8f3c802b137031d5f464bcf0ab6c0"),
+    ("ca-bundle.crt",    "7416d8751c49b11e12b9744b10950fda2b54ec38882ae91f46d20560e888a521"),
+)
+
+
+def _file_sha256(path):
+    """算文件 SHA256；读不了返回空串。"""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(256 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 def base_dir():
@@ -52,16 +79,13 @@ def base_dir():
 
 
 def builtin_ca_files():
-    """列出可用的内置 CA 文件（按文件名排序，缺失目录/空目录返回空列表）。"""
+    """列出可用的内置 CA 文件（固定清单，只返回真实存在的）。"""
     d = os.path.join(base_dir(), CA_SUBDIR)
-    try:
-        names = sorted(os.listdir(d))
-    except OSError:
-        return []
     out = []
-    for n in names:
-        if n.lower().endswith(CA_EXTS):
-            out.append(os.path.join(d, n))
+    for name, _sha in BUILTIN_CA:
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            out.append(p)
     return out
 
 
@@ -92,9 +116,19 @@ def build_ssl_context(verify=True, log_fn=None):
     except Exception:
         pass
 
+    expect = dict(BUILTIN_CA)
     for path in builtin_ca_files():
         name = os.path.basename(path)
         info["files"].append(name)
+        want = expect.get(name, "")
+        if want and _file_sha256(path) != want:
+            # 内容与发布时不一致 → 宁可不加载。这里防的是「有人往程序目录里
+            # 放一张同名根证书」：信任锚必须是发布时固定的那几张。
+            reason = "内容与发布时不一致（可能被替换），已跳过"
+            info["failed"].append("%s: %s" % (name, reason))
+            if log_fn:
+                log_fn("[SSL] 内置证书校验失败 %s：%s" % (name, reason))
+            continue
         try:
             # load_verify_locations 是**累加**语义：在已有信任库基础上追加，
             # 不会丢弃系统库 —— 这是「叠加而非替换」的实现基础。

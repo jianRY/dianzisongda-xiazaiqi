@@ -64,8 +64,28 @@ MAX_RETRY = 3
 RETRY_BACKOFF = 2.0  # 秒
 
 
+# ---------- 输出 ----------
+# 送达链接里的 qdbh/sdbh/sdsin 是免登录下载当事人全部文书的凭证。
+# 终端输出经常被用户整段截图/复制贴到群里求助，所以在这里统一打码：
+# 保留参数名与前 3 位，足以比对「是不是同一条链接」，但无法据此下载。
+_OUT_REDACT_KEYS = ("sdsin", "sdbh", "qdbh", "sid", "token", "access_token",
+                    "access_key", "key", "sign", "signature")
+_OUT_REDACT_RE = re.compile(
+    r"(?i)\b(%s)=([^&\s#\"'<>]+)" % "|".join(_OUT_REDACT_KEYS))
+
+
+def _redact(text):
+    """把文本里的送达凭证打码（只影响输出，不影响实际请求参数）。"""
+    try:
+        def _sub(m):
+            return "%s=%s***" % (m.group(1), m.group(2)[:3])
+        return _OUT_REDACT_RE.sub(_sub, str(text))
+    except Exception:  # noqa: BLE001
+        return str(text)
+
+
 def log(msg):
-    print(msg, flush=True)
+    print(_redact(msg), flush=True)
 
 
 # ---------- 1. 解析输入 ----------
@@ -124,7 +144,7 @@ def fetch_doc_list(params, ctx):
         except Exception as e:  # noqa: BLE001
             last = e
             if attempt < 3:
-                print("  ⚠ 取清单失败（第 %d 次）：%s —— 稍后重试…" % (attempt, e))
+                log("  ⚠ 取清单失败（第 %d 次）：%s —— 稍后重试…" % (attempt, e))
                 time.sleep(1.2 * attempt)
     raise last
 

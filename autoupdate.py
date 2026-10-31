@@ -63,6 +63,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # 信任库构造：系统库 + 随包内置公共 CA（叠加，不替换）。
@@ -107,6 +108,75 @@ try:
 except Exception:                              # 源码公开 / 未配置
     SITE_URL = ""
 
+# ---------------- 更新链的信任边界（改这里之前先读完这段） ----------------
+# 更新元数据 update.json 同时给出「exe 下载地址」和「sha256」，它是整条链唯一的
+# 信任锚。如果元数据从第三方加速镜像取，镜像可以**同时**换掉 exe 和 sha256 ——
+# 校验值来自被篡改方，等于没有校验（2026-10-31 审查发现）。
+#
+# 因此把职责拆开：
+#   · 元数据（2KB）只能来自**可信 HTTPS 源**：GitHub 原站 / api.github.com；
+#   · 镜像与备用源只用于**下载几十 MB 的 exe 字节**（要快就快，篡改也过不了 sha256）。
+# 代价：国内检查更新时取 2KB 元数据要直连 GitHub，慢 1~2 秒 —— 值得。
+TRUSTED_META_HOSTS = ("github.com", "www.github.com", "api.github.com",
+                      "objects.githubusercontent.com")
+
+
+def _site_base():
+    """自有站地址（去掉末尾斜杠）。
+
+    配置里写成 ``https://example.com`` 还是 ``https://example.com/`` 都能用：
+    后者直接拼 ``%s/updates/...`` 会得到 ``//updates/``，部分 WAF/CDN 会 404。
+    """
+    return (SITE_URL or "").rstrip("/")
+
+
+def _is_trusted_meta_url(url):
+    """这个地址能否作为 update.json 的可信来源（决定要不要自动更新）。"""
+    try:
+        p = urllib.parse.urlsplit(str(url or ""))
+    except Exception:  # noqa: BLE001
+        return False
+    if p.scheme.lower() != "https":
+        return False
+    host = (p.hostname or "").lower()
+    if host in TRUSTED_META_HOSTS:
+        return True
+    # 自建站：只有上了 TLS 才配当元数据源。
+    site = _site_base()
+    try:
+        sp = urllib.parse.urlsplit(site)
+        if site and host == (sp.hostname or "").lower() and sp.scheme.lower() == "https":
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _is_downloadable(url):
+    """下载地址的 scheme 白名单。
+
+    防的是 update.json 被篡改成 file:// / ftp:// 之类的地址 —— urllib 对 file://
+    是照单全收的，那等于让远端指定「读本地哪个文件当程序装」。
+    http 允许：完整性由可信源给的 sha256 兜底。
+    """
+    try:
+        return urllib.parse.urlsplit(str(url or "")).scheme.lower() in ("https", "http")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _looks_like_exe(path):
+    """粗校验：Windows 可执行文件必须以 MZ 开头。
+
+    防的是「拿到一个 html 错误页 / 压缩包，却当成新版本装进程序目录」。
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 # GitHub 仓库 → 服务器上的 update.json 文件名（与更新源 REPOS 配置一致）
 _REPO_TO_APP = {
     "jianry/dianzisongda-xiazaiqi": "court",
@@ -125,7 +195,7 @@ def _server_meta_url(api_url):
     if not m:
         return None
     key = _REPO_TO_APP.get(m.group(1).lower())
-    return "%s/updates/%s.json" % (SITE_URL, key) if (key and SITE_URL) else None
+    return "%s/updates/%s.json" % (_site_base(), key) if (key and _site_base()) else None
 
 
 # ---------------- 公共 GitHub 加速镜像（2026-09-22 新增，同日调整为「主源」） ----------------
@@ -177,7 +247,7 @@ def _src_label(url):
     for p in MIRROR_PREFIXES:
         if u.startswith(p):
             return "加速镜像 %s" % p.split("//")[1].strip("/")
-    if SITE_URL and u.startswith(SITE_URL):
+    if _site_base() and u.startswith(_site_base()):
         return "备用源"
     if "github.com/" in u:
         return "GitHub 原站"
@@ -197,6 +267,9 @@ def build_download_sources(urls):
     for u in (urls or []):
         u = (u or "").strip()
         if not u:
+            continue
+        # scheme 白名单：挡掉 file:// / ftp:// 这类「让远端指定读本地哪个文件」的地址
+        if not _is_downloadable(u):
             continue
         if "github.com/" in u:
             for p in MIRROR_PREFIXES:
@@ -404,12 +477,16 @@ def _looks_like_installer(name):
 
 
 def fetch_latest_release(api_url, timeout=15):
-    """返回 dict(tag, notes, download_url)；无可用 exe 资产时 download_url 为 None。
+    """返回 dict(tag, notes, download_url, sha256)；无可用 exe 资产时 download_url 为 None。
 
     download_url 只会指向「绿色单文件版」exe：名字含 setup/installer/安装 的资产一律跳过
     （这类是安装包，交给用户手动下载安装，不能被自动更新消费）。
     若 Release 里只有安装包，则返回 None，让界面提示「未找到可下载的更新文件」，
     而不是把安装器当成新版程序下载下来。
+
+    sha256 取自 asset 的 digest 字段（GitHub 服务端算的内容摘要，形如 "sha256:..."）。
+    为什么重要：这条路径走 api.github.com，比 github.com 稳定得多；有了 digest，
+    「取不到 update.json 就没法安全更新」的死路就通了 —— 两条可信路径都能给校验值。
     """
     req = urllib.request.Request(
         api_url,
@@ -419,7 +496,7 @@ def fetch_latest_release(api_url, timeout=15):
     with urllib.request.urlopen(req, timeout=timeout,
                                 context=_ssl_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    dl = None
+    dl, dl_sha = None, ""
     for a in data.get("assets", []):
         name = str(a.get("name", ""))
         if not name.lower().endswith(".exe"):
@@ -427,19 +504,26 @@ def fetch_latest_release(api_url, timeout=15):
         if _looks_like_installer(name):
             continue
         dl = a.get("browser_download_url")
+        digest = str(a.get("digest") or "")
+        if digest.lower().startswith("sha256:"):
+            dl_sha = digest.split(":", 1)[1].strip().lower()
         break
     return {
         "tag": data.get("tag_name", ""),
         "notes": data.get("body", "") or "",
         "download_url": dl,
         "download_urls": [dl] if dl else [],
-        "sha256": "",
+        "sha256": dl_sha,
         "html_url": data.get("html_url", ""),
         "source": "GitHub API",
     }
 
 
 def _http_json(url, timeout=8):
+    # 兜底闸门：update.json 只允许从可信 HTTPS 源读取（见 TRUSTED_META_HOSTS）。
+    # 放在这一层，将来谁再往候选列表里塞镜像地址也会被直接拒掉。
+    if not _is_trusted_meta_url(url):
+        raise ValueError("拒绝从不信任的来源读取更新元数据：%s" % _src_label(url))
     req = urllib.request.Request(
         url, headers={"User-Agent": UA, "Accept": "application/json"}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout,
@@ -471,19 +555,17 @@ def _release_meta_url(api_url):
 
 
 def fetch_update_info(latest_api_url, timeout=5, log_fn=None):
-    """按「加速镜像 → GitHub 原站 → 备用源 → GitHub API」依次尝试取更新信息。
+    """取更新信息：可信 HTTPS 源（GitHub 原站 / 自建 https 站）→ GitHub API 兜底。
 
-    2026-09-22 调整：源顺序反转 —— 主源改为 GitHub 加速镜像，备用源退为兜底。
-    起因是实测裸网直连 GitHub 只有 3.7 KB/s，而镜像能到 439 KB/s；备用源
-    受阿里云 ECS 固定带宽限制封顶 445 KB/s，已不再有速度优势。
+    2026-10-31 调整（安全修复）：元数据**不再走加速镜像**。
+        镜像同时给出 exe 与 sha256，一旦镜像被控就能两者一起换 —— 校验等于没有。
+        镜像现在只用于下载 exe 字节（见 build_download_sources），完整性由这里
+        拿到的 sha256 兜底。代价是国内取 2KB 元数据要直连 GitHub，慢 1~2 秒。
 
-    为什么 update.json 必须排在 GitHub API 之前：
-        只有 update.json 带 sha256，是完整性校验的唯一依据；
-        API 不返回该字段，优先走 API 等于每次都把校验跳过。
-
-    timeout 默认 5 秒：候选共 5 个，最坏全挂要等约 25 秒；正常情况下
-    第一个源不到 1 秒就返回（后台静默检查跑在独立线程，不会卡住界面）。
-    全部失败返回 None —— 静默失败，绝不因为检查更新把软件卡住。
+    为什么 update.json 仍排在 GitHub API 之前：
+        它由发版脚本生成、与版本严格同步；API 的 asset digest 是第二条可信来源，
+        但只在 update.json 取不到时才用（少一次 API 调用，也省流量）。
+        两条路径都必须给出 sha256 —— 拿不到就拒绝自动更新，见 run_update_check。
     """
     def _log(m):
         try:
@@ -492,14 +574,14 @@ def fetch_update_info(latest_api_url, timeout=5, log_fn=None):
         except Exception:  # noqa: BLE001
             pass
 
+    # 备用源当前是 http（见 _endpoints.py），按上面的规则不配当元数据源；
+    # 它仍会出现在下载候选里（build_download_sources），只是不给 sha256 作保。
     meta_urls = []
     rel = _release_meta_url(latest_api_url)
-    if rel:
-        for p in MIRROR_PREFIXES:
-            meta_urls.append((p + rel, _src_label(p + rel)))
+    if rel and _is_trusted_meta_url(rel):
         meta_urls.append((rel, _src_label(rel)))
     srv = _server_meta_url(latest_api_url)
-    if srv:
+    if srv and _is_trusted_meta_url(srv):
         meta_urls.append((srv, "备用源"))
 
     for url, source in meta_urls:
@@ -1058,6 +1140,20 @@ def run_update_check(parent, app_name, current_version, latest_api_url, config_f
                 parent.after(0, lambda: messagebox.showinfo(
                     "检查更新", "发现新版本 %s，但未找到可下载的更新文件。" % tag))
             return
+        # 没有 sha256 → 元数据不可信（多半是只有 GitHub API 兜底成功）。
+        # 自动安装这条路上，sha256 是唯一的完整性依据，缺了就不装。
+        if not (info.get("sha256") or "").strip():
+            if log_fn:
+                try:
+                    log_fn("⚠ 更新元数据缺少 sha256，已拒绝自动更新（防投毒）")
+                except Exception:  # noqa: BLE001
+                    pass
+            if manual:
+                msg = ("发现新版本 %s，但本次更新信息缺少完整性校验值，"
+                       "出于安全考虑不会自动安装。\n\n"
+                       "请前往 GitHub Releases 手动下载。" % tag)
+                parent.after(0, lambda m=msg: messagebox.showwarning("检查更新", m))
+            return
 
         # 有新版 → 主线程弹窗
         # cleanup_old 默认值：宿主显式传 > 配置文件里的上次选择 > 默认勾选
@@ -1334,9 +1430,26 @@ class DownloadProgressDialog(tk.Toplevel):
 
     def _worker(self):
         st = self._state
-        tmp = os.path.join(tempfile.gettempdir(), "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
+        # 临时文件名必须随机且独占：固定名会被同机其它进程预置/覆盖，
+        # 多开两个实例同时更新时也会互相踩（都往同一个 _更新.exe 里写）。
+        try:
+            _fd, tmp = tempfile.mkstemp(
+                prefix="%s_" % re.sub(r"\W+", "_", self._app_name),
+                suffix="_更新.exe")
+            os.close(_fd)
+        except Exception:  # noqa: BLE001
+            tmp = os.path.join(tempfile.gettempdir(),
+                               "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
+        # 把实际路径告诉收尾逻辑：_finish 取消/失败时要删的就是这个文件，
+        # 不能再用固定名去猜（名字是随机生成的，猜不到就删不掉，会在 %TEMP% 堆垃圾）。
+        st["tmp"] = tmp
         sources = build_download_sources(self._urls)
         if not sources:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
             st["error"] = IOError("没有可用的下载地址")
             st["running"] = False
             return
@@ -1367,8 +1480,16 @@ class DownloadProgressDialog(tk.Toplevel):
                     raise IOError("下载不完整（%d / %d 字节）" % (done, want))
                 if os.path.getsize(tmp) < 100000:
                     raise IOError("下载文件过小，疑似失败")
-                if self._sha256 and _file_sha256(tmp) != self._sha256:
+                # sha256 必须非空：下载源（镜像 / 明文备用源）本身不可信，
+                # 这个值来自可信 HTTPS 源，是唯一的完整性依据。缺了就不装 ——
+                # 宁可让用户去 Releases 手动下载，也不执行来路不明的 exe。
+                if not self._sha256:
+                    raise IOError("更新包缺少 sha256 校验值，已拒绝安装。"
+                                  "请到 GitHub Releases 手动下载。")
+                if _file_sha256(tmp) != self._sha256:
                     raise IOError("文件校验失败（SHA256 不一致），已丢弃")
+                if not _looks_like_exe(tmp):
+                    raise IOError("下载到的不是可执行文件（缺少 MZ 头），已丢弃")
                 st["result"] = tmp
                 st["running"] = False
                 return
@@ -1462,8 +1583,10 @@ class DownloadProgressDialog(tk.Toplevel):
         self.destroy()
         # 记下临时文件路径：取消/失败时要用它清掉半截的 exe。
         # （成功时不能删 —— 那一路要交给 install_helper 搬进程序目录）
-        tmp = os.path.join(tempfile.gettempdir(),
-                           "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
+        # 优先用 worker 实际创建的那个路径（mkstemp 是随机名），只在拿不到时回退到旧固定名。
+        tmp = (self._state or {}).get("tmp") or os.path.join(
+            tempfile.gettempdir(),
+            "%s_更新.exe" % re.sub(r"\W+", "_", self._app_name))
         if cancelled:
             self._discard_partial(tmp)
             if self._log_fn:
