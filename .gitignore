@@ -57,3 +57,21 @@ id_ed25519
 # 例外：随程序分发的**公共** CA 证书（非私钥，公开信息，必须入库才能打包）
 # 用 .crt 扩展名（证书的标准扩展名），避免与私钥类 *.pem 规则混淆。
 !assets/ca/*.crt
+
+# ---- 编辑器 / IDE / 系统杂项（任何情况下都不入库）----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
