@@ -1,0 +1,15 @@
+# 法院文书下载器 —— 依赖清单
+#
+# 安装：
+#   pip install -r requirements.txt
+#
+# 主程序**只依赖 Python 标准库**（tkinter / urllib / ssl / concurrent.futures 等），
+# 下面两项都不是运行必需：
+#   · PyMuPDF  —— 仅在「把下载到的 PDF 转成图片」时才需要（懒加载，缺了会自动跳过该功能）
+#   · pyinstaller —— 仅构建 exe 时需要
+
+# ---- 可选：PDF 转图片（不装则该功能自动不可用，主程序照常工作） ----
+PyMuPDF==1.28.2
+
+# ---- 构建/发版需要（运行 exe 不需要） ----
+pyinstaller==6.22.2

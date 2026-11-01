@@ -75,3 +75,15 @@ $RECYCLE.BIN/
 *.bak
 *.orig
 *.rej
+*.old
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 前端 / Node（本项目无前端，防御性排除） ----
+node_modules/
+.next/
+out/
+dist_*/
