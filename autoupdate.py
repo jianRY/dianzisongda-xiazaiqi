@@ -477,14 +477,19 @@ class UpdateDialog(_gui.UpdateDialog):
                  tag=None, notes=None, download_url=None, config_file=None,
                  install_helper=None, log_fn=None, on_before_install=None,
                  download_urls=None, sha256="", html_url="",
-                 cleanup_old_default=True):
+                 cleanup_old_default=True, site_url=""):
+        # ⚠️ 这里是**适配层**，参数表必须跟着共享界面层走。
+        #    v2.14.0 就栽在这上面：run_update_check 传了 site_url，本签名没接，
+        #    parent.after 里的 TypeError 被 Tk 的 report_callback_exception 吞掉，
+        #    结果「版本查得到、弹窗永远不出来」——两版都没人能看到更新提示。
+        #    新增界面层参数时，这里必须同步加一行并转发。
         super().__init__(
             master, app_name=app_name, current_version=current_version,
             tag=tag, notes=notes, download_url=download_url,
             config_file=config_file, install_helper=install_helper,
             log_fn=log_fn, on_before_install=on_before_install,
             download_urls=download_urls, sha256=sha256, html_url=html_url,
-            cleanup_old_default=cleanup_old_default,
+            cleanup_old_default=cleanup_old_default, site_url=site_url,
             cfg=CFG, write_flag_fn=None)
 
 
@@ -497,12 +502,15 @@ class DownloadProgressDialog(_gui.DownloadProgressDialog):
     def __init__(self, master=None, app_name=None, download_url=None,
                  install_helper=None, log_fn=None, on_before_install=None,
                  download_urls=None, sha256="", cleanup_old=True,
-                 auto_restart=True):
+                 auto_restart=True, html_url="", site_url=""):
+        # 同 UpdateDialog：界面层新增的参数一律在这里补上并转发，
+        # 否则宿主直接构造本类时会 TypeError（更新失败提示里就没有手动下载地址了）。
         super().__init__(
             master, app_name=app_name, download_url=download_url,
             install_helper=install_helper, log_fn=log_fn,
             on_before_install=on_before_install, download_urls=download_urls,
             sha256=sha256, cleanup_old=cleanup_old, auto_restart=auto_restart,
+            html_url=html_url, site_url=site_url,
             cfg=CFG, write_flag_fn=None)
 
 
