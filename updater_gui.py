@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, scrolledtext, ttk
 
 # 引用共享内核。
@@ -113,7 +114,8 @@ class UpdateDialog(tk.Toplevel):
                  download_url=None, config_file=None, install_helper=None,
                  log_fn=None, on_before_install=None,
                  download_urls=None, sha256="", html_url="",
-                 cleanup_old_default=True, cfg=None, write_flag_fn=None):
+                 cleanup_old_default=True, cfg=None, write_flag_fn=None,
+                 site_url=""):
         super().__init__(master)
         self.title("发现新版本 · %s" % app_name)
         self.configure(bg="#F2F4F8")
@@ -126,6 +128,7 @@ class UpdateDialog(tk.Toplevel):
         self._download_urls = list(download_urls or ([download_url] if download_url else []))
         self._sha256 = sha256
         self._html_url = html_url
+        self._site_url = site_url
         self._download_url = self._download_urls[0] if self._download_urls else None
         self._app_name = app_name
         self._config_file = config_file
@@ -152,6 +155,24 @@ class UpdateDialog(tk.Toplevel):
             txt.pack(fill="both", expand=True, pady=(4, 10))
             txt.insert("1.0", core.strip_md(notes))
             txt.configure(state="disabled")
+
+        # 「手动下载」入口：自动更新随时可能被墙 / 代理 / 杀毒软件拦掉，那时用户
+        # 只会看到一句「更新失败」；窗口里若没有可点的地址，等于「知道有新版却
+        # 拿不到」。所以**发现新版时**就把地址摆出来，点一下用系统浏览器打开，
+        # 完全不依赖自动更新是否成功。
+        # ⚠️ 文案用「自动更新失败？」，是在事前给出退路，不是咒它失败。
+        links = core.manual_download_links(site_url, html_url, self._download_urls)
+        if links:
+            lf = ttk.Frame(frm)
+            lf.pack(fill="x", pady=(0, 6))
+            ttk.Label(lf, text="自动更新失败？手动下载：",
+                      font=("Microsoft YaHei UI", 9)).pack(side="left")
+            for i, (label, url) in enumerate(links[:2]):
+                lb = ttk.Label(lf, text=label, cursor="hand2",
+                               foreground="#1a56db",
+                               font=("Microsoft YaHei UI", 9))
+                lb.pack(side="left", padx=(6 if i else 4, 0))
+                lb.bind("<Button-1>", lambda e, u=url: self._open_url(u))
 
         # 「更新后是否删除旧版本文件」：默认勾选（= 保持旧行为）。
         # 取消勾选时旧版本 exe 会保留在程序目录里，但**会被改名**成
@@ -185,6 +206,20 @@ class UpdateDialog(tk.Toplevel):
             pass
         self.destroy()
 
+    def _open_url(self, url):
+        """用系统默认浏览器打开地址。失败也不弹错 —— 这只是辅助入口，
+        绝不能因为「浏览器打不开」把更新主流程的提示盖掉。"""
+        opened = False
+        try:
+            opened = bool(webbrowser.open(url))
+        except Exception:  # noqa: BLE001
+            opened = False
+        if self._log_fn:
+            try:
+                self._log_fn(("↪ 已在浏览器打开：%s" if opened else "手动下载地址：%s") % url)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _on_update(self):
         cleanup_old = bool(self._keep_old.get())
         # 记住这次选择，下次弹窗用同样的默认值（配置写失败不影响更新本身）
@@ -202,6 +237,7 @@ class UpdateDialog(tk.Toplevel):
             self.master, app_name=self._app_name,
             download_url=self._download_url,
             download_urls=self._download_urls, sha256=self._sha256,
+            html_url=self._html_url, site_url=self._site_url,
             install_helper=self._install_helper, log_fn=self._log_fn,
             on_before_install=self._on_before_install,
             cleanup_old=cleanup_old,
@@ -240,7 +276,7 @@ class DownloadProgressDialog(tk.Toplevel):
     def __init__(self, master, app_name, download_url=None, install_helper=None,
                  log_fn=None, on_before_install=None,
                  download_urls=None, sha256="", cleanup_old=True, cfg=None,
-                 write_flag_fn=None):
+                 write_flag_fn=None, html_url="", site_url=""):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
         self.configure(bg="#F2F4F8")
@@ -253,6 +289,9 @@ class DownloadProgressDialog(tk.Toplevel):
         self._urls = [u for u in (download_urls or ([download_url] if download_url else [])) if u]
         self._url = self._urls[0] if self._urls else None
         self._sha256 = (sha256 or "").strip().lower()
+        # 失败时要把「手动下载去哪下」告诉用户，所以这两个地址一路带下来。
+        self._html_url = html_url or ""
+        self._site_url = site_url or ""
         self._app_name = app_name
         self._install_helper = install_helper
         self._log_fn = log_fn
@@ -550,8 +589,27 @@ class DownloadProgressDialog(tk.Toplevel):
             return
         if error is not None:
             self._discard_partial(tmp)
-            messagebox.showerror("更新失败", "下载新版本失败：%s" % error)
+            # 失败时**必须**给出可手动下载的地址：用户此刻最需要的就是「去哪下」，
+            # 而更新链挂掉的原因五花八门（被墙 / 代理 / 杀毒 / 临时 502），
+            # 光报一句「下载失败」等于把人晾在原地。
+            hint = core.manual_download_text(
+                getattr(self, "_site_url", ""), getattr(self, "_html_url", ""),
+                getattr(self, "_urls", None))
+            msg = "下载新版本失败：%s" % error
+            if hint:
+                msg += "\n\n" + hint + "\n\n装好新版后自动更新即恢复正常；" \
+                                       "也可以稍后在软件里点「检查更新」重试。"
+            messagebox.showerror("更新失败", msg)
             self._log("✗ 更新下载失败：%s" % error)
+            if hint:
+                try:
+                    self._log("↪ 手动下载地址：" + "；".join(
+                        "%s %s" % (k, v) for k, v in core.manual_download_links(
+                            getattr(self, "_site_url", ""),
+                            getattr(self, "_html_url", ""),
+                            getattr(self, "_urls", None))))
+                except Exception:  # noqa: BLE001
+                    pass
             return
         # 成功 → 交给宿主安装（默认：就地落位 + 启动新版）
         try:

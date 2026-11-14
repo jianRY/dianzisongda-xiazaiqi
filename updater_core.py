@@ -88,7 +88,7 @@ __all__ = [
 ]
 
 # 内核版本号：改动内核后 +1，同步脚本据此判断副本是否过期。
-CORE_VERSION = "1.0.2"
+CORE_VERSION = "1.1.0"
 
 # ---------------- 常量 ----------------
 UA = (
@@ -320,6 +320,53 @@ def strip_md(text, limit=4000):
     if len(t) > limit:
         t = t[:limit] + "\n…（更多见 Release 页）"
     return t
+
+
+# ============================================================== 手动下载入口
+
+
+def manual_download_links(site_url="", html_url="", download_urls=None):
+    """自动更新失败时可用的手动下载入口：[("标签", "地址")]。
+
+    为什么要有它（2026-11-14：2.12.0/2.13.0 两版自动更新全挂，用户只看到
+    一句「更新失败」，窗口里没有任何可点的地址 —— 等于「知道有新版，却不知道
+    去哪下」）。这条入口必须在三处同时出现，且**共用同一份推导逻辑**，
+    免得地址各写一份、换站点时漏改：
+
+      ① 更新弹窗（发现新版本时就能直接手动下，不用等失败）
+      ② 更新失败提示框 + 运行日志
+      ③ 发版写进 Release 说明（= 弹窗里的「本次更新内容」）与 CHANGELOG
+
+    顺序 = 自有站（国内直连，最可能通）→ Release 页（含历史版本与校验信息）
+    → 直链（点开就下）。只收 HTTPS（与更新链基线一致），重复地址只留第一次。
+    """
+    out = []
+
+    def _add(label, url):
+        u = str(url or "").strip()
+        if not u or not u.lower().startswith("https://"):
+            return
+        if any(u == x[1] for x in out):
+            return
+        out.append((label, u))
+
+    _add("官网下载页", site_url)
+    _add("Release 页", html_url)
+    for u in list(download_urls or [])[:1]:
+        _add("直链", u)
+    return out
+
+
+def manual_download_text(site_url="", html_url="", download_urls=None):
+    """把手动下载入口拼成纯文本（失败弹窗 / 日志用）。无可用地址时返回空串。
+
+    ⚠️ 必须写**裸地址**，不能用 markdown 的 `[文字](地址)`：弹窗正文要过
+       strip_md()，那种写法会被还原成只剩文字，地址反而丢了。
+    """
+    items = manual_download_links(site_url, html_url, download_urls)
+    if not items:
+        return ""
+    return "可手动下载安装：\n" + "\n".join("  · %s：%s" % (k, v) for k, v in items)
 
 
 # ============================================================== 下载源

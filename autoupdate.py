@@ -204,6 +204,27 @@ def _site_base():
     return CFG.site_base
 
 
+def _release_page_url():
+    """本仓库的 Release 页（含全部历史版本与校验信息）。"""
+    return ("https://github.com/%s/releases/latest" % CFG.repo) if CFG.repo else ""
+
+
+def manual_download_text():
+    """「手动下载去哪下」的统一文案（弹窗 / 日志共用）。
+
+    ⚠️ 地址推导集中在共享内核的 manual_download_links()，
+       这里只补本项目的两个入口（自有站 + Release 页），
+       避免以后换域名/换仓库时满文件里改地址。
+    """
+    return _core.manual_download_text(_site_base(), _release_page_url())
+
+
+def _manual_hint():
+    """给提示框用的一句话（无可用地址时返回空串）。"""
+    t = manual_download_text()
+    return ("\n\n" + t) if t else ""
+
+
 def _is_trusted_meta_url(url=None):
     return _core.is_trusted_meta_url(url, CFG)
 
@@ -515,21 +536,22 @@ def run_update_check(parent=None, app_name=None, current_version=None,
         except urllib.error.HTTPError as e:
             if manual:
                 if e.code in (401, 403, 404):
-                    msg = "无法检查更新：仓库/Release 不可见（可能为私有），可前往 GitHub 手动下载。"
+                    msg = ("无法检查更新：仓库/Release 不可见（可能为私有）。"
+                           + _manual_hint())
                 else:
-                    msg = "检查更新失败（HTTP %d）。" % e.code
+                    msg = "检查更新失败（HTTP %d）。" % e.code + _manual_hint()
                 parent.after(0, lambda m=msg: messagebox.showwarning("检查更新", m))
             return
         except Exception as e:  # noqa: BLE001
             if manual:
                 parent.after(0, lambda err=e: messagebox.showwarning(
-                    "检查更新", "检查更新失败：%s" % err))
+                    "检查更新", "检查更新失败：%s" % err + _manual_hint()))
             return
 
         if not info:
             if manual:
                 parent.after(0, lambda: messagebox.showinfo(
-                    "检查更新", "检查更新失败，请稍后重试或前往 GitHub 手动下载。"))
+                    "检查更新", "检查更新失败，请稍后重试。" + _manual_hint()))
             return
 
         tag = info.get("tag", "")
@@ -544,7 +566,8 @@ def run_update_check(parent=None, app_name=None, current_version=None,
         if not urls:
             if manual:
                 parent.after(0, lambda: messagebox.showinfo(
-                    "检查更新", "发现新版本 %s，但未找到可下载的更新文件。" % tag))
+                    "检查更新", "发现新版本 %s，但未找到可下载的更新文件。" % tag
+                    + _manual_hint()))
             return
         # 没有 sha256 → 元数据不可信（多半是只有 GitHub API 兜底成功）。
         # 自动安装这条路上，sha256 是唯一的完整性依据，缺了就不装。
@@ -556,8 +579,7 @@ def run_update_check(parent=None, app_name=None, current_version=None,
                     pass
             if manual:
                 msg = ("发现新版本 %s，但本次更新信息缺少完整性校验值，"
-                       "出于安全考虑不会自动安装。\n\n"
-                       "请前往 GitHub Releases 手动下载。" % tag)
+                       "出于安全考虑不会自动安装。" % tag + _manual_hint())
                 parent.after(0, lambda m=msg: messagebox.showwarning("检查更新", m))
             return
 
@@ -570,6 +592,8 @@ def run_update_check(parent=None, app_name=None, current_version=None,
             tag=tag, notes=info.get("notes", ""),
             download_urls=urls, sha256=info.get("sha256", ""),
             html_url=info.get("html_url", ""),
+            # 「手动下载」入口：官网 + Release 页（弹窗里可点，见 updater_gui）
+            site_url=_site_base(),
             config_file=config_file, install_helper=install_helper, log_fn=log_fn,
             on_before_install=on_before_install,
             cleanup_old_default=default_cleanup,
