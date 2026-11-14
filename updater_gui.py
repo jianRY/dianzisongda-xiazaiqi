@@ -344,7 +344,15 @@ class DownloadProgressDialog(tk.Toplevel):
         if done > 0:
             headers["Range"] = "bytes=%d-" % done
         req = urllib.request.Request(url, headers=headers, method="GET")
-        ctx = (self._cfg.ssl_context if self._cfg else None)
+        # ⚠️⚠️ 必须走 core.resolve_ssl_context()，不能直接取 cfg.ssl_context：
+        #   各项目允许把 ssl_context 传成「惰性构造函数」（法院项目就是这样，
+        #   避免每次请求都重读证书库）。直接把函数塞给 urlopen(context=)，
+        #   建立 TLS 时 http.client 会调 context.wrap_socket(...) →
+        #   AttributeError: 'function' object has no attribute 'wrap_socket'。
+        #   这个坑在 v2.12.0 的共享内核重构里引入：取元数据那几处都走了 resolve，
+        #   唯独下载这条路漏了 ⇒ 表现是「能检查到新版本，一点更新就失败」，
+        #   而且新旧版本都卡死（坏代码在用户机器上），只能手动下载绕过。
+        ctx = core.resolve_ssl_context(self._cfg)
         if ctx is not None:
             resp = urllib.request.urlopen(req, timeout=30, context=ctx)
         else:
