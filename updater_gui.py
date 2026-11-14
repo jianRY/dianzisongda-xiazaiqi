@@ -110,6 +110,12 @@ def _mkbtn(parent, text, cmd, primary=False):
 class UpdateDialog(tk.Toplevel):
     """发现新版本 → 三个选择：立即更新 / 本次忽略 / 以后不再提醒。"""
 
+    # 更新完成后是否自动启动新版本。
+    #   True （默认，历史行为）= 装完就拉起新版，用户无感；
+    #   False = 只落位、不拉起，装完弹一句「请重新运行程序」后退出。
+    # 适配层直接写 `UpdateDialog.AUTO_RESTART = False` 即可，不用改内核。
+    AUTO_RESTART = True
+
     def __init__(self, master, app_name, current_version, tag, notes,
                  download_url=None, config_file=None, install_helper=None,
                  log_fn=None, on_before_install=None,
@@ -241,6 +247,7 @@ class UpdateDialog(tk.Toplevel):
             install_helper=self._install_helper, log_fn=self._log_fn,
             on_before_install=self._on_before_install,
             cleanup_old=cleanup_old,
+            auto_restart=self.AUTO_RESTART,
             cfg=self._cfg,
             # 传类级钩子（而不是实例属性）：子类可以覆盖它，
             # 适配层则用它来指向自己模块的 write_cleanup_flag。
@@ -276,7 +283,7 @@ class DownloadProgressDialog(tk.Toplevel):
     def __init__(self, master, app_name, download_url=None, install_helper=None,
                  log_fn=None, on_before_install=None,
                  download_urls=None, sha256="", cleanup_old=True, cfg=None,
-                 write_flag_fn=None, html_url="", site_url=""):
+                 write_flag_fn=None, html_url="", site_url="", auto_restart=True):
         super().__init__(master)
         self.title("正在下载更新 · %s" % app_name)
         self.configure(bg="#F2F4F8")
@@ -301,6 +308,8 @@ class DownloadProgressDialog(tk.Toplevel):
         # install_helper 可能被宿主换成自定义函数，所以**用关键字传**并在调用处
         # 兼容旧签名（只接受 2 个位置参数的老函数）——别把宿主的老回调弄崩。
         self._cleanup_old = bool(cleanup_old)
+        # 更新完是否自动拉起新版本（见 UpdateDialog.AUTO_RESTART 的说明）
+        self._auto_restart = bool(auto_restart)
         self._cancel_evt = threading.Event()
         self._has_spare = False
         self._dl_thread = None
@@ -611,20 +620,35 @@ class DownloadProgressDialog(tk.Toplevel):
                 except Exception:  # noqa: BLE001
                     pass
             return
-        # 成功 → 交给宿主安装（默认：就地落位 + 启动新版）
+        # 成功 → 交给宿主安装（默认：就地落位；AUTO_RESTART 决定是否顺手拉起新版）
         try:
             self._call_install_helper(done_path)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("更新失败", "更新未完成：%s" % e)
             return
-        # 新版已就位并启动。本进程必须真正退出：既避免两个实例同时存在，
-        # 也为了释放旧版文件的锁，新版才能把它删掉。
+        # 先让宿主收尾（停后台任务、销毁窗口等），再决定「自动重启」还是「提示手动重开」。
+        # ⚠️ 提示必须在这里弹：restart=False 时新版本已经顶掉原文件名，本进程必须退出放锁，
+        #    所以要趁窗口还活着把话说完。
+        auto_restart = bool(getattr(self, "_auto_restart", True))
+        if not auto_restart:
+            # 不自动拉起时，必须**明确告诉用户「已更新、请重新打开」**：
+            # 否则窗口里还是旧版界面，用户会以为更新根本没成功。
+            self._log("✓ 更新完成：新版本已就位（未自动启动，重新运行程序后生效）")
+            try:
+                messagebox.showinfo(
+                    "更新完成",
+                    "更新已完成，新版本已安装到原位置。\n\n"
+                    "点「确定」后本程序会关闭，请重新打开「%s」即可使用新版本。"
+                    % (getattr(self, "_app_name", "") or "本程序"))
+            except Exception:  # noqa: BLE001
+                pass
         try:
             if self._on_before_install:
                 self._on_before_install()
         except Exception:  # noqa: BLE001
             pass
-        self._exit_app()
+        # 本进程必须真正退出：既避免两个实例同时存在，也为了释放旧版文件的锁。
+        self._exit_app(restart=auto_restart)
 
     def _discard_partial(self, path):
         """删掉没下完的临时 exe。
@@ -661,12 +685,12 @@ class DownloadProgressDialog(tk.Toplevel):
             pass
 
     def _call_install_helper(self, done_path):
-        """调用宿主给的安装函数，并带上 cleanup_old。
+        """调用宿主给的安装函数，并带上 cleanup_old / restart。
 
         为什么要这么啰嗦：`install_helper` 是开放给宿主的回调，**可能有项目还在用
-        只接受 2 个位置参数的老签名**（不接 cleanup_old）。直接多传关键字会让它抛
-        TypeError → 用户看到「更新未完成」，但其实文件已经下好了，比不做还糟。
-        所以：先按新签名试，被拒绝就退回老签名。
+        只接受 2 个位置参数的老签名**（不接 cleanup_old），也可能有不接 restart 的。
+        直接多传关键字会让它抛 TypeError → 用户看到「更新未完成」，但其实文件已经
+        下好了，比不做还糟。所以：参数从多到少逐级回退。
 
         ⚠️「写标记文件」必须放在调用 helper **之前**的公共路径上：
         曾写在「helper 拒绝新签名」的异常分支里，于是宿主自带一个**支持 cleanup_old
@@ -692,27 +716,43 @@ class DownloadProgressDialog(tk.Toplevel):
                    self._cleanup_old)
         except Exception:  # noqa: BLE001
             pass
-        # ② 再调宿主安装函数
+        # ② 再调宿主安装函数：能少传就少传，退回时**必须记日志**，
+        #    因为退回后 restart 约定可能不成立（helper 会自作主张拉起新版）。
+        want_restart = bool(getattr(self, "_auto_restart", True))
+        try:
+            self._install_helper(done_path, self._log_fn,
+                                 cleanup_old=self._cleanup_old,
+                                 restart=want_restart)
+            return
+        except TypeError as e:
+            # 只在「参数不匹配」时退回；安装逻辑内部的 TypeError 必须暴露出来
+            if "restart" not in str(e) and "cleanup_old" not in str(e):
+                raise
+            self._log("安装函数未适配新参数，改用兼容签名调用。")
+        if not want_restart:
+            # helper 不认识 restart ⇒ 它一定会自动拉起新版。此时不能静默：
+            # 用户在界面上看到的是「请重新运行」，实际却会自己弹一个新窗口。
+            self._log("⚠ 安装函数不支持「不自动启动」，本次仍会自动打开新版本。")
         try:
             self._install_helper(done_path, self._log_fn,
                                  cleanup_old=self._cleanup_old)
             return
         except TypeError as e:
-            # 只在「参数不匹配」时退回；安装逻辑内部的 TypeError 必须暴露出来
             if "cleanup_old" not in str(e):
                 raise
             self._log("安装函数使用旧签名，改为默认保留旧版本的清理策略。")
         self._install_helper(done_path, self._log_fn)
 
-    def _exit_app(self):
+    def _exit_app(self, restart=True):
         """关闭主窗口并结束进程。
 
-        新版此刻已接管原文件名并启动，本进程必须真正退出：一是让新版成为唯一实例，
-        二是释放对「旧版_<时间戳>.exe」的文件锁，新版才能删掉它。
+        不论是「自动重启」还是「提示用户手动重开」，本进程都必须真正退出：
+        一是让新版成为唯一实例，二是释放对旧版文件的文件锁（改名/清理都要它）。
         这里不弹模态框——模态框要等用户点击，会让本进程迟迟不退出。
         """
         master = self.master
-        self._log("新版本已就位，程序即将自动重启…")
+        self._log("新版本已就位，程序即将自动重启…" if restart
+                  else "新版本已就位，本程序退出后请重新运行。")
         try:
             master.destroy()
         except Exception:  # noqa: BLE001

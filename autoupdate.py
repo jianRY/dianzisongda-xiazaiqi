@@ -431,10 +431,18 @@ def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=No
                                      purge_fn=_purge, is_frozen_fn=_is_frozen)
 
 
-def windows_replace_and_restart(new_exe_path=None, log_fn=None, cleanup_old=True):
+def windows_replace_and_restart(new_exe_path=None, log_fn=None, cleanup_old=True,
+                                restart=True):
+    """就地更新（旧接口名保留）。
+
+    restart=False：落位后**不自动启动**新版本，由界面提示用户重新运行。
+    这个参数必须原样转发 —— 共享界面层会按 UpdateDialog.AUTO_RESTART 传下来，
+    适配层如果吞掉它，用户看到的「请重新运行」就会和实际行为（自动弹出新窗口）打架。
+    """
     return _core.windows_replace_and_restart(new_exe_path, log_fn=log_fn,
                                              cleanup_old=cleanup_old,
-                                             app_name=APP_NAME)
+                                             app_name=APP_NAME,
+                                             restart=restart)
 
 
 def send_to_recycle_bin(path=None):
@@ -488,13 +496,24 @@ class DownloadProgressDialog(_gui.DownloadProgressDialog):
 
     def __init__(self, master=None, app_name=None, download_url=None,
                  install_helper=None, log_fn=None, on_before_install=None,
-                 download_urls=None, sha256="", cleanup_old=True):
+                 download_urls=None, sha256="", cleanup_old=True,
+                 auto_restart=True):
         super().__init__(
             master, app_name=app_name, download_url=download_url,
             install_helper=install_helper, log_fn=log_fn,
             on_before_install=on_before_install, download_urls=download_urls,
-            sha256=sha256, cleanup_old=cleanup_old,
+            sha256=sha256, cleanup_old=cleanup_old, auto_restart=auto_restart,
             cfg=CFG, write_flag_fn=None)
+
+
+# ================================================================ 本项目选项
+
+# 更新完成后**不自动打开**新版本：装完只提示「请重新运行程序」，由用户自己再打开。
+# 为什么（2026-11-14 建哥要求）：新版一启动就会重建窗口、抢占焦点，用户往往正在看
+# 上一个案件的结果；而且更新后第一次启动要重读证书库、初始化更快，让用户自己触发
+# 更可控。只影响本项目 —— 其它三个项目仍走内核默认（自动重启）。
+UpdateDialog.AUTO_RESTART = False
+
 
 
 _SwitchedSource = _gui._SwitchedSource

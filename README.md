@@ -8,7 +8,7 @@
 
 全国法院统一送达平台电子送达文书自动下载工具。粘贴送达短信或链接，自动提取该案件全部文书并下载为 PDF，支持**多线程并发下载**、批量、转 JPG、防合并命名、自动更新（含更新内容展示 / 三选项 / 进度速度 / 随时取消）。
 
-## 功能特性（v2.14.0）
+## 功能特性（v2.15.0）
 
 - 自动识别 `zxfw.court.gov.cn` 送达链接（支持整段短信 / 一次粘贴多个链接批量下载）
 - **容错粘贴**：链接后面跟中文标点（`，。；：？！【】「」` 等）也能正确识别参数 —— 法院短信的标准句式就是「……&sdsin=XXX，请及时查阅。」，直接整段粘贴即可
@@ -81,8 +81,8 @@ pyinstaller --onefile --windowed --noupx --hidden-import=fitz \
 **安装包**（需先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)）：
 
 ```bash
-python installer/make_assets.py 2.14.0    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
-ISCC.exe installer.iss /DAppVersion=2.14.0 /DSrcExe="dist\法院文书下载器_v2.14.0.exe"
+python installer/make_assets.py 2.15.0    # 生成中文语言包与向导配图（产物已随仓库走，通常无需重跑）
+ISCC.exe installer.iss /DAppVersion=2.15.0 /DSrcExe="dist\法院文书下载器_v2.15.0.exe"
 ```
 
 `installer.iss` **不再提供默认版本号**（写死的默认值会让「忘记传参」变成静默的错误版本），漏传 `/DAppVersion` 会直接编译失败。
@@ -91,7 +91,7 @@ ISCC.exe installer.iss /DAppVersion=2.14.0 /DSrcExe="dist\法院文书下载器_
 
 | 文件                            | 说明                               |
 | ----------------------------- | -------------------------------- |
-| `court_doc_downloader_gui.py` | 图形界面主程序（v2.14.0）                 |
+| `court_doc_downloader_gui.py` | 图形界面主程序（v2.15.0）                 |
 | `autoupdate.py`               | 自动更新的**本项目适配层**：只放本项目特有的配置（仓库名、产物前缀、站点标签），其余全部转发给共享内核；旧接口名全部保留，接入方式不变 |
 | `updater_core.py`             | 跨项目共享的自动更新内核（纯逻辑，零三方依赖、不依赖 Tk）。与另外三个软件共用同一份，**由统一脚本同步，请勿直接改** |
 | `updater_gui.py`              | 自动更新的界面层（提示升级 / 下载进度 / 安装）。同样由统一脚本同步 |
