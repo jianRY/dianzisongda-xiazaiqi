@@ -38,6 +38,7 @@ import hashlib
 import io
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -67,7 +68,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -87,6 +88,11 @@ APP_ID = "jianRY.CourtDocDownloader"
 # 为什么必须落盘：日志只画在界面上时，一旦界面刷新出问题（或进程被强杀），
 # 用户能看到的就只有「点了没反应」——曾经因此排查了两天。落盘后任何异常都留痕。
 _LOG_LOCK = threading.Lock()
+# 当前日志文件的「缓存状态」：key=(目录, 日期) / path / 已写字节数（-1=未知）。
+# 见 write_log_file 的说明：避免每行都去 stat 一次磁盘。
+_LOG_STATE = {"key": None, "path": "", "size": -1}
+_LOG_MAX_BYTES = 3 * 1024 * 1024
+_LOG_KEEP_BYTES = 1024 * 1024
 
 # 日志里绝不能出现送达链接的查询串：qdbh/sdbh/sdsin 这三元组是**免登录**访问
 # 当事人全部文书的凭证。日志落到 %LOCALAPPDATA% 后会被用户整份发给技术支持，
@@ -98,11 +104,26 @@ _REDACT_RE = re.compile(r"(?i)\b(%s)=([^&\s#\"'<>]+)" % "|".join(_REDACT_KEYS))
 
 
 def redact_text(s):
-    """把文本里的送达凭证打码：保留参数名与前 3 位，便于比对是否同一条链接。"""
+    """把文本里的送达凭证打码成「参数名 + 短指纹」。
+
+    ⚠️ 原来是「保留前 3 位，便于比对是否同一条链接」。但 qdbh/sdbh/sdsin 三个参数
+    就是**免登录**访问当事人全部文书的凭证，前 3 位同样是凭证的一部分（少几位
+    只是增加了爆破成本，并没有改变性质）。现在改为对值取 SHA256 前 8 位：
+    依旧能判断「两次是不是同一条链接」，但一个原始字符都拿不到。
+    指纹形如 `sdsin=#6fe10705`，二次脱敏幂等（`#` 不在值字符集里）。
+    """
     try:
+        t = str(s)
+        # 快路径：日志每行都要过这里，没有「key=值」形态就完全不必跑正则
+        if "=" not in t:
+            return t
+
         def _sub(m):
-            return "%s=%s***" % (m.group(1), m.group(2)[:3])
-        return _REDACT_RE.sub(_sub, str(s))
+            key, val = m.group(1), m.group(2)
+            fp = hashlib.sha256(val.encode("utf-8", "replace")).hexdigest()[:8]
+            return "%s=#%s" % (key, fp)
+
+        return _REDACT_RE.sub(_sub, t)
     except Exception:
         return str(s)
 
@@ -169,25 +190,49 @@ def _safe_text(s):
 
 
 def write_log_file(line):
-    """把一行日志追加到当天的日志文件；任何失败都静默（绝不影响主流程）。"""
+    """把一行日志追加到当天的日志文件；任何失败都静默（绝不影响主流程）。
+
+    ⚠️ 性能：原来每写一行都 os.path.getsize() 一次（一次额外系统调用），
+    而日志是每秒几十条地写、全天累计上万行 —— 纯属浪费。
+    现在把「当天文件路径 + 已写字节数」缓存在内存里，只在跨天（或路径变了）
+    时 stat 一次，之后靠累加计数判断要不要轮转。
+    """
     try:
         d = log_dir()
         with _LOG_LOCK:
+            day = time.strftime("%Y%m%d")
+            # key 里带上目录：测试/宿主会 monkeypatch log_dir，缓存必须跟着走
+            key = (d, day)
+            if _LOG_STATE.get("key") != key:
+                _LOG_STATE["key"] = key
+                _LOG_STATE["path"] = os.path.join(d, "运行日志_%s.log" % day)
+                _LOG_STATE["size"] = -1          # -1 = 未知，首次写入时 stat
+            p = _LOG_STATE["path"]
             os.makedirs(d, exist_ok=True)
-            p = os.path.join(d, "运行日志_%s.log" % time.strftime("%Y%m%d"))
+            if _LOG_STATE["size"] < 0:
+                try:
+                    _LOG_STATE["size"] = os.path.getsize(p)
+                except OSError:
+                    _LOG_STATE["size"] = 0
             # 简单轮转：超过 3MB 就留最后 1MB，避免无限增长
-            try:
-                if os.path.getsize(p) > 3 * 1024 * 1024:
+            if _LOG_STATE["size"] > _LOG_MAX_BYTES:
+                try:
                     with open(p, "r", encoding="utf-8", errors="replace") as f:
-                        tail = f.read()[-1024 * 1024:]
-                    with open(p, "w", encoding="utf-8") as f:
-                        f.write("…（日志过大，仅保留最近部分）…\n" + tail)
-            except OSError:
-                pass
-            with open(p, "a", encoding="utf-8") as f:
-                # 二道保险：直接调 write_log_file 的地方（traceback / 界面异常）
-                # 不经过 _safe_text，在这里统一脱敏，保证落盘内容永远不含送达凭证。
-                f.write(redact_text(line) + "\n")
+                        tail = f.read()[-_LOG_KEEP_BYTES:]
+                    blob = ("…（日志过大，仅保留最近部分）…\n" + tail).encode("utf-8")
+                    # ⚠️ 用二进制写：文本模式下 Windows 会把每个 \n 翻成 \r\n，
+                    #    我们缓存的「已写字节数」就会比真实文件小，轮转阈值随之失真。
+                    with open(p, "wb") as f:
+                        f.write(blob)
+                    _LOG_STATE["size"] = len(blob)
+                except OSError:
+                    pass
+            # 二道保险：直接调 write_log_file 的地方（traceback / 界面异常）
+            # 不经过 _safe_text，在这里统一脱敏，保证落盘内容永远不含送达凭证。
+            data = (redact_text(line) + "\n").encode("utf-8")
+            with open(p, "ab") as f:
+                f.write(data)
+            _LOG_STATE["size"] += len(data)
     except Exception:
         pass
 
@@ -408,13 +453,40 @@ def fetch_doc_list(params, ctx, attempts=3, on_retry=None):
     raise last
 
 
+def _discard(path):
+    """删掉下载用的临时文件。
+
+    删不掉**不能**让下载流程崩（文件可能被杀软/预览器占用），但也**不能**像以前
+    那样静默 pass —— 那正是「半截文件留在磁盘上被下次当成已下载」的成因之一，
+    出问题时日志里至少要看得出是哪个文件没删掉。
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        try:
+            write_log_file("[下载] 无法删除临时文件 %s：%s"
+                           % (os.path.basename(path), e))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def download_file(url, path, ctx, cancel_check=None):
     """下载单个文书文件。
 
     Args:
         cancel_check: 可选的零参数回调，返回 True 表示已取消 → 抛 CancelledError 提前退出。
+
+    ⚠️ 先写 `<目标名>.<pid>.part`，全部校验通过后再 os.replace 成正式文件名。
+    为什么：直接写目标文件时，进程被强杀 / 断电 / 文件被占用会留下半截文件，
+    而「跳过已存在」的判定只看 getsize>0 —— 下次运行会把这份坏文件当成已下载
+    跳过，用户永远拿到一个打不开的 PDF，界面却显示「✓ 已保存」（而且删除失败
+    时原来那几处 os.remove 是静默 pass，日志里连痕迹都没有）。
     """
     last_err = None
+    # 带上 pid：两个实例同时跑同一案件时不至于互相写坏对方的临时文件。
+    tmp = "%s.%d.part" % (path, os.getpid())
 
     class _Cancelled(Exception):
         pass
@@ -438,7 +510,7 @@ def download_file(url, path, ctx, cancel_check=None):
                 except (TypeError, ValueError):
                     expect = 0
                 written = 0
-                with open(path, "wb") as f:
+                with open(tmp, "wb") as f:
                     while True:
                         if cancel_check and cancel_check():
                             raise _Cancelled()
@@ -447,7 +519,7 @@ def download_file(url, path, ctx, cancel_check=None):
                             break
                         f.write(buf)
                         written += len(buf)
-            if os.path.getsize(path) == 0:
+            if os.path.getsize(tmp) == 0:
                 raise IOError("下载到 0 字节")
             if expect and written != expect:
                 raise IOError("下载不完整（%d / %d 字节），将重试" % (written, expect))
@@ -455,31 +527,26 @@ def download_file(url, path, ctx, cancel_check=None):
             #  · 文书不一定是 PDF（法院也可能发 jpg / docx），所以只在 .pdf 上强制 %PDF- 魔数，
             #    否则所有非 PDF 文书都会被误判失败并重试 3 次；
             #  · 但对任何类型都拦一下「错误页」——OSS 出错会返回 XML / HTML，文件头能认出来。
-            with open(path, "rb") as f:
+            with open(tmp, "rb") as f:
                 head = f.read(32)
             low = head.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
             if low.startswith((b"<?xml", b"<html", b"<!doctype", b"<error")):
-                os.remove(path)
+                _discard(tmp)
                 raise IOError("服务端返回的是错误页而非文件（链接可能已过期）")
             if path.lower().endswith(".pdf") and not head.startswith(b"%PDF-"):
-                os.remove(path)
+                _discard(tmp)
                 raise IOError("PDF 文件头异常，疑似下载失败")
+            # 全部校验通过才落地：os.replace 在同一分区上是原子的，
+            # 正式文件名一旦出现，内容就一定是完整的。
+            os.replace(tmp, path)
             return True
         except _Cancelled:
-            # 取消：删半成品文件后向上抛
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            # 取消：删临时文件后向上抛
+            _discard(tmp)
             raise
         except Exception as e:  # noqa: BLE001
             last_err = e
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            _discard(tmp)
             if attempt < MAX_RETRY:
                 time.sleep(RETRY_BACKOFF * attempt)
     raise RuntimeError("下载失败（已重试 %d 次）：%s" % (MAX_RETRY, last_err))
@@ -574,8 +641,13 @@ def _find_existing_case_dir(base, prefix):
     best, best_mt = None, -1.0
     try:
         if prefix and os.path.isdir(base):
+            # 只认两种名字：`prefix` 本身，或 `prefix_<数字>`（我们创建的
+            # 「法院_案号_年月日时分秒」）。原来用 startswith(prefix + "_")，
+            # 会把「案号是本案号前缀」的另一个案件也当成同一案（123 匹配 1234_…），
+            # 于是两份不同案子的文书被合并进同一个文件夹。
+            pat = re.compile(r"^%s_\d{1,20}$" % re.escape(prefix))
             for name in os.listdir(base):
-                if name != prefix and not name.startswith(prefix + "_"):
+                if name != prefix and not pat.match(name):
                     continue
                 full = os.path.join(base, name)
                 if not os.path.isdir(full):
@@ -588,19 +660,70 @@ def _find_existing_case_dir(base, prefix):
     return best
 
 
+def _looks_complete(path):
+    """磁盘上已有文件能否当作「已下载完成」（跳过判定用）。
+
+    光看「大小 > 0」不够：旧版本是直接往目标文件写的，中断/被强杀会留下
+    半截文件，一旦被判定为「已存在」跳过，这一份就永远缺了。
+    这里对 .pdf 额外验一下魔数；不像 PDF 就重新下载（重下会覆盖它）。
+    """
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        if str(path).lower().endswith(".pdf"):
+            with open(path, "rb") as f:
+                return f.read(5) == b"%PDF-"
+        return True
+    except OSError:
+        return False
+
+
 def _jpg_output_exists(pdf_path, case_dir, mode):
-    """该 PDF 对应的 JPG 是否已生成过（复用案件文件夹时用来决定要不要补转）。
+    """该 PDF 对应的 JPG 是否**完整**生成过（复用案件文件夹时用来决定要不要补转）。
 
     命名规则见 convert_pdf_to_jpg：单页 stem.jpg，多页 stem_1.jpg、stem_2.jpg…
+
+    ⚠️ 原来只判断「目录里存在任意一张 stem_数字.jpg」就算转好了。多页 PDF 中途
+    失败（或用户中途取消）会留下前几页，此后每次重下都被判「已存在，跳过」，
+    缺掉的页永远补不回来，界面也不给任何提示 —— 用户只会发现图片少了几张。
+    现在按页数逐张核对：一张不缺才算转完；缺任何一张就整体重转（覆盖写）。
     """
     stem = sanitize_filename(os.path.splitext(os.path.basename(pdf_path))[0])
     img_dir = (os.path.join(case_dir, "图片", stem) if mode == JPG_MODE_PERPDF
                else os.path.join(case_dir, "图片"))
-    pat = re.compile(re.escape(stem) + r"(?:_\d+)?\.jpg$", re.IGNORECASE)
     try:
-        return any(pat.match(n) for n in os.listdir(img_dir))
+        have = {n.lower() for n in os.listdir(img_dir)}
     except OSError:
         return False
+
+    pages = _pdf_page_count(pdf_path)
+    if pages <= 0:
+        # 页数读不出来（PDF 损坏 / 没装 PyMuPDF）→ 退回旧判定：
+        # 有任意一张就当作已转，至少不会把「已经转好」的重复转一遍。
+        pat = re.compile(re.escape(stem) + r"(?:_\d+)?\.jpg$", re.IGNORECASE)
+        return any(pat.match(nm) for nm in have)
+    if pages == 1:
+        return (stem + ".jpg").lower() in have
+    return all((stem + "_%d.jpg" % i).lower() in have for i in range(1, pages + 1))
+
+
+def _pdf_page_count(pdf_path):
+    """PDF 页数；读不出来返回 0（调用方按「未知」处理）。"""
+    try:
+        import fitz  # PyMuPDF，懒加载（仅转换时需要）
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        # fitz 不保证线程安全，而本函数会被多个下载线程并发调用 ——
+        # 必须与 convert_pdf_to_jpg 共用同一把全局锁。
+        with _FITZ_LOCK:
+            doc = fitz.open(pdf_path)
+            try:
+                return int(doc.page_count)
+            finally:
+                doc.close()
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ---------------- PDF -> JPG 转换（PyMuPDF / fitz） ----------------
@@ -641,10 +764,12 @@ def convert_pdf_to_jpg(pdf_path, case_dir, mode, lock=None):
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 suffix = ("_%d" % (p + 1)) if n > 1 else ""
                 out_path = os.path.join(img_dir, stem + suffix + ".jpg")
-                try:
-                    pix.save(out_path, "jpg", jpeg_quality=95)
-                except TypeError:
-                    pix.save(out_path, "jpg")
+                # ⚠️ 参数名是 jpg_quality，不是 jpeg_quality（PyMuPDF 1.x）。
+                #    写成 jpeg_quality 会抛 TypeError；这里原来还套着一层
+                #    「捕获 TypeError 就用默认参数再存一次」的兜底，结果**每一页**
+                #    都静默走兜底分支 —— 画质参数从未生效，真正的编码错误也被一起吞掉。
+                #    现在参数写对，且不再兜底：真出错就让调用方记「✗ 转 JPG 失败」。
+                pix.save(out_path, "jpg", jpg_quality=JPG_QUALITY)
                 count += 1
             return count
         finally:
@@ -672,6 +797,9 @@ AUTO_OPEN_EACH = 2     # 打开每个案件各自的文件夹
 
 JPG_MODE_SINGLE = 0    # 所有图片放在一个“图片”文件夹内
 JPG_MODE_PERPDF = 1    # 按 PDF 文件名分别建子文件夹存放图片
+
+# 导出 JPEG 的质量（PyMuPDF 的 Pixmap.save 默认也是 95，这里显式写出来便于调整）。
+JPG_QUALITY = 95
 
 
 def config_path():
@@ -715,6 +843,31 @@ def load_config():
     return cfg
 
 
+def _atomic_write_json(path, data):
+    """原子写 JSON：先写同目录临时文件，再 os.replace 顶替。
+
+    ⚠️ 直接 open(path, "w") 是先截断再写：写到一半断电 / 被占用 / 被强杀，
+    磁盘上就只剩半截 JSON。而本程序读配置的每个地方都是 `except: 用默认值`，
+    于是用户会「莫名其妙地被重置成出厂设置」，且日志里什么都没有。
+    os.replace 在同分区上是原子的，要么旧内容、要么新内容，不会出现半截文件。
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=None,
                 skip_existing=True):
     """保存配置。
@@ -723,27 +876,40 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=None
     该字段由更新模块（autoupdate._save_auto_update）在用户选「以后不再提醒」时写 false，
     本函数若以默认 True 落盘，用户随后只要改动任意一个选项就会被悄悄重置回 true
     ——「以后不再提醒」形同虚设。
+
+    ⚠️ 实现上必须「先读原文件、只覆盖自己负责的键」：
+    config.json 是**多个模块共用**的一份文件，更新模块还会往里写 cleanup_old
+    （「更新后是否删除旧版本」的勾选状态）。原来这里用一个固定的 6 字段字典
+    整份覆盖，等于把同文件里其他键全删了 —— 用户取消勾选后只要再动一下设置
+    （比如换个保存目录），下次更新又变成「自动删除旧版」，且毫无提示。
     """
     try:
         p = config_path()
+        # 原文件读不出来（不存在 / 损坏）就当成空字典：反正接下来要整份重写。
+        data = {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, dict):
+                data = old
+        except Exception:  # noqa: BLE001
+            data = {}
+
         if auto_update is None:
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    auto_update = bool(json.load(f).get("auto_update", True))
-            except Exception:
-                auto_update = True
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump({
-                "out_dir": out_dir,
-                "auto_open_mode": int(auto_open_mode),
-                "convert_jpg": bool(convert_jpg),
-                "jpg_mode": int(jpg_mode),
-                "auto_update": bool(auto_update),
-                "skip_existing": bool(skip_existing),
-                # 标记：auto_open_mode 的一次性迁移已执行过，之后用户手选「不打开」不再被覆盖
-                "migrated_open": True,
-            }, f, ensure_ascii=False, indent=2)
+            auto_update = bool(data.get("auto_update", True))
+
+        # 只更新本函数负责的键，其余键（cleanup_old 等）原样保留。
+        data.update({
+            "out_dir": out_dir,
+            "auto_open_mode": int(auto_open_mode),
+            "convert_jpg": bool(convert_jpg),
+            "jpg_mode": int(jpg_mode),
+            "auto_update": bool(auto_update),
+            "skip_existing": bool(skip_existing),
+            # 标记：auto_open_mode 的一次性迁移已执行过，之后用户手选「不打开」不再被覆盖
+            "migrated_open": True,
+        })
+        _atomic_write_json(p, data)
     except Exception:
         pass
 
@@ -790,6 +956,8 @@ class App:
         self._ui_queue = queue.Queue()
         self._pump_job = None
         self._closing = False
+        self._dpi_checked = 0.0              # 上次检查「显示器缩放是否变了」的时间
+        self._win_logical = (860, 780)       # 主窗口的逻辑尺寸（DPI 变化后按新比例重设）
 
         root.title("法院文书下载器 v" + VERSION)
         root.resizable(True, True)
@@ -810,7 +978,12 @@ class App:
         avail_w = int(root.winfo_screenwidth() / K.SCALE) - 40
         avail_h = int(root.winfo_screenheight() / K.SCALE) - 90
         win_w, win_h = min(win_w, avail_w), min(win_h, avail_h)
+        self._win_logical = (win_w, win_h)
         root.geometry("%dx%d" % (K.u(win_w), K.u(win_h)))
+        # 换显示器（DPI 变了）时给一次提示：Tk 无法重排已建控件的像素尺寸，
+        # 硬改缩放比只会让「新画的 Canvas」与「老控件」错位，所以这里只按新比例
+        # 重设窗口大小，并明确告诉用户「重启后最准」，别让他对着畸大的窗口发懵。
+        root.bind("<Configure>", self._on_root_configure, add="+")
 
         # 顶部菜单栏
         self._build_menubar()
@@ -1026,7 +1199,11 @@ class App:
         if self._closing:
             return
         try:
-            while True:
+            # 每轮最多执行 200 个回调，而不是「抽干为止」：
+            # 回调里往往会继续投递（开始下载 → 一串日志 → 可能的收尾动作），
+            # 队列若一直不空，while True 会霸占主线程，界面（含「取消」按钮）
+            # 直到这次下载结束都画不出来。留一点余量给 Tk 重绘，剩下的下一轮再说。
+            for _ in range(200):
                 fn = self._ui_queue.get_nowait()
                 try:
                     fn()
@@ -1050,6 +1227,28 @@ class App:
             self._pump_job = self.root.after(40, self._pump)
         except tk.TclError:
             self._pump_job = None  # 窗口已销毁
+
+    def _on_root_configure(self, _evt=None):
+        """换显示器（DPI 变化）检测 —— 节流 2 秒，<Configure> 触发非常频繁。"""
+        now = time.time()
+        if now - self._dpi_checked < 2.0:
+            return
+        self._dpi_checked = now
+        try:
+            changed = K.refresh_scale(self.root)
+        except Exception:  # noqa: BLE001
+            return
+        if not changed:
+            return
+        # 只按新比例重设窗口尺寸：已建控件的像素尺寸 Tk 不会跟着变，
+        # 硬重排整套界面属于「重建 UI」，代价与风险都不值得为这个场景承担。
+        try:
+            w, h = self._win_logical
+            self.root.geometry("%dx%d" % (K.u(w), K.u(h)))
+        except Exception:  # noqa: BLE001
+            pass
+        self.log_msg("⚠ 检测到显示器缩放变化（当前 %d%%）—— 已按新比例调整窗口；"
+                     "重启程序后界面尺寸最准确" % round(K.SCALE * 100))
 
     def _settle_after_update(self):
         """更新后首次启动：登记「退出时把文件改成软件名_v实际版本号」+ 清理旧版文件。
@@ -1668,7 +1867,7 @@ class App:
                         return (i_, raw_, "cancelled", None, full_)
                     # 已存在同名文件跳过：重复下载同一案件时省时省流量
                     # （复用了旧案件文件夹才可能命中；需要重下时取消勾选即可）
-                    if self.skip_existing and os.path.exists(full_) and os.path.getsize(full_) > 0:
+                    if self.skip_existing and _looks_complete(full_):
                         msg = "    ⏭ 已存在，跳过：%s" % os.path.basename(full_)
                         # 上次可能没勾转 JPG，本次勾了 → 补转一次，否则用户会以为转换丢了
                         if (self.convert_jpg

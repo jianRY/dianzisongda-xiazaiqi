@@ -195,7 +195,10 @@ def download_file(url, path, ctx):
                 },
                 method="GET",
             )
-            with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+            # 超时与 GUI 版保持一致（30s）：这是 socket 读超时，不是总耗时上限 ——
+            # 单块 64KB 30s 读不到就已经是「网络断了」而不是「网络慢」，
+            # 交给下面 3 次重试更划算；写 120s 会让卡死的连接白等 2 分钟。
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
                 # 与 GUI 版一致：读 Content-Length，下完比对，提早发现半截包
                 expect = resp.headers.get("Content-Length")
                 expect = int(expect) if expect and expect.isdigit() else None

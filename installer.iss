@@ -5,8 +5,10 @@
 ;        安装包（开始菜单 / 桌面快捷方式 / 系统「已安装的应用」里可卸载）。
 ;
 ;  编译（由 .pybuild_cache\发版脚本 自动调用，也可手动跑）：
-;      ISCC.exe installer.iss /DAppVersion=2.10.2 /DSrcExe="dist\法院文书下载器_v2.10.2.exe"
+;      ISCC.exe installer.iss /DAppVersion=<版本号> /DSrcExe="dist\法院文书下载器_v<版本号>.exe"
 ;      版本号标准＝三段式 X.Y.Z（项目组 2026-09-27 定）
+;      ⚠️ 这里的示例**不写具体版本号**：写死的示例会被当成默认值照抄，
+;         历史上就因为注释里留着旧版本号，手工编译编出过一个自称旧版的安装包。
 ;
 ;  ⚠️ 为什么固定「仅为当前用户安装」（PrivilegesRequired=lowest）：
 ;     程序内置就地自动更新 —— 下载新版后要往「程序所在目录」写文件。

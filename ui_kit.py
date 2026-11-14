@@ -39,6 +39,25 @@ def setup_scale(root):
     return SCALE
 
 
+def refresh_scale(root):
+    """重新按**当前所在显示器**的 DPI 计算缩放比，变化返回 True。
+
+    ⚠️ 已知边界：Tk 不能重排已经创建出来的控件的像素尺寸，所以这里只更新
+    SCALE（影响之后新建的弹窗/画布），不会让主界面自动「重新长一遍」。
+    调用方应把「比例变了」当成「提示用户重启更准 + 重新设定窗口大小」来用，
+    不要指望它把整个界面重排 —— 那属于重建 UI，不在本函数职责内。
+    """
+    global SCALE
+    try:
+        cur = root.winfo_fpixels("1i") / 96.0
+    except Exception:
+        return False
+    if not cur or abs(cur - SCALE) < 0.02:
+        return False
+    SCALE = cur
+    return True
+
+
 def u(v):
     """逻辑尺寸 → 物理像素。"""
     return int(round(v * SCALE))
@@ -419,6 +438,10 @@ class RoundProgress(tk.Canvas):
 class LogView(tk.Frame):
     """带分级着色的日志区（✓ 绿 / ⚠ 琥珀 / ✗ 红 / 标题蓝 / ⏸ 蓝）。"""
 
+    # 保留的最大行数。超过后一次性掐掉最旧的一批（不是每加一行删一行，
+    # 否则大日志量下每条都要重排整个 Text，反而更慢）。
+    MAX_LINES = 3000
+
     def __init__(self, master):
         sk = SKIN
         super().__init__(master, bg=sk.card)
@@ -454,6 +477,15 @@ class LogView(tk.Frame):
     def append(self, msg):
         self.txt.configure(state=tk.NORMAL)
         self.txt.insert(tk.END, msg + "\n", self.tag_for(msg) or ())
+        # 行数上限：下载几百份文书时日志能涨到几万行，Text 每插一行都要重排整块
+        # 缓冲并刷新滚动条，界面会越跑越卡（还占内存）。超过上限就掐掉最旧的
+        # 一批，留出余量再触发，摊薄单次开销。
+        try:
+            lines = int(self.txt.index("end-1c").split(".")[0])
+            if lines > self.MAX_LINES + 500:
+                self.txt.delete("1.0", "%d.0" % (lines - self.MAX_LINES + 1))
+        except Exception:  # noqa: BLE001
+            pass
         self.txt.see(tk.END)
         self.txt.configure(state=tk.DISABLED)
 

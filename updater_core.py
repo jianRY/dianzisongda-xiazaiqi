@@ -88,7 +88,7 @@ __all__ = [
 ]
 
 # 内核版本号：改动内核后 +1，同步脚本据此判断副本是否过期。
-CORE_VERSION = "1.0.0"
+CORE_VERSION = "1.0.1"
 
 # ---------------- 常量 ----------------
 UA = (
@@ -847,12 +847,30 @@ def _read_json(path):
 
 
 def _write_json(path, data):
+    """原子写 JSON：先写同目录临时文件，再 os.replace 顶替。
+
+    ⚠️ 直接 open(path, "w") 是先截断后写。写到一半断电 / 被杀进程 / 文件被占用，
+    磁盘上就只剩半截 JSON；而读配置的每个调用方都是「读失败 → 用默认值」，
+    于是用户会「莫名其妙被重置成出厂设置」，日志里一个字都没有。
+    os.replace 在同分区上是原子操作：要么旧内容、要么新内容，不会出现半截文件。
+    """
     try:
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=".cfg-", suffix=".tmp", dir=d or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
         return True
     except Exception:
         return False
@@ -1100,26 +1118,34 @@ def write_cleanup_flag(directory, cleanup_old):
 def read_and_consume_cleanup_flag(directory):
     """新版进程：读取旧版留下的选择并删掉标记文件。
 
-    返回 True/False 表示要不要删旧版；**文件不存在时返回 True**（默认保持原行为，
-    不因为机制故障就悄悄改成「保留一堆旧版文件」）。
+    返回 True/False 表示要不要删旧版；**文件不存在 / 读不出来时返回 True**
+    （默认保持原行为，不因为机制故障就悄悄改成「保留一堆旧版文件」）。
 
     必须「读完就删」：这个文件表达的是「本次更新」的意图，若留着会被下一次启动
     当成新决策反复生效，用户后来改了勾选状态也不生效。
+
+    ⚠️ 这里**没有任何异常可以抛出去**：它跑在 settle_after_update 里，也就是
+    每次启动的路径上。原来只 except OSError，且 txt 只在 try 内赋值 ——
+    文件被其他编码写过 / 内容损坏（UnicodeDecodeError）时异常会一路穿到启动流程，
+    轻则少做一次清理，重则整个启动流程中断。现在一律兜住并当作「默认」。
     """
     path = os.path.join(directory or "", CLEANUP_FLAG)
+    txt = ""
     try:
         if not os.path.exists(path):
             return True
+        # 严格按 UTF-8 读：内容损坏（非 UTF-8 字节）时宁愿当「没有决定」，
+        # 也不要用 errors="replace" 硬解出一堆乱码再猜用户勾了什么。
         with open(path, "r", encoding="utf-8") as f:
             txt = f.read()
-    except OSError:
+    except Exception:  # noqa: BLE001
         return True
     finally:
         try:
             os.remove(path)
         except OSError:
             pass
-    return "cleanup_old=0" not in txt.replace(" ", "")
+    return "cleanup_old=0" not in (txt or "").replace(" ", "")
 
 
 # ---------------------------------------------------------------- 待改名登记
@@ -1302,7 +1328,9 @@ def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=No
     if cleanup_old is None:
         cleanup_old = read_and_consume_cleanup_flag(directory)
     _log("旧版本文件处理方式：%s" % ("更新完成后自动删除"
-                                   if cleanup_old else "保留（用户取消了勾选）"))
+                                   if cleanup_old else
+                                   "保留 —— 会被改名为「<软件名>_旧版_<时间戳>.exe」"
+                                   "留在程序目录，可直接双击它回退到旧版"))
 
     # ① 名字不对时：腾位置 + 登记待改名（**不在这里动手**）
     if os.path.abspath(current).lower() != os.path.abspath(final).lower():

@@ -32,10 +32,12 @@
     )
 """
 
+import copy
 import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 from tkinter import messagebox
 
 import updater_core as _core
@@ -234,8 +236,46 @@ def _sha256_from_notes(notes=None):
     return _core.sha256_from_notes(notes)
 
 
+def _repo_from_api_url(url):
+    """从 GitHub API 地址里取出 "owner/name"；取不到返回空串。
+
+    只认 `https://api.github.com/repos/<owner>/<name>/releases/…` 这一种形态
+    （加速镜像在前面加前缀也照样能解析，因为只看 path）。
+    """
+    try:
+        p = urllib.parse.urlsplit(str(url or ""))
+    except Exception:  # noqa: BLE001
+        return ""
+    parts = [x for x in (p.path or "").split("/") if x]
+    # 加速镜像会在前面加一层前缀（https://gh-proxy.com/https://api.github.com/repos/…），
+    # 所以不能要求 repos 必须在第 0 段，从任意位置找即可。
+    try:
+        i = [x.lower() for x in parts].index("repos")
+    except ValueError:
+        return ""
+    if len(parts) >= i + 3:
+        return "%s/%s" % (parts[i + 1], parts[i + 2])
+    return ""
+
+
+def _cfg_for(latest_api_url=None):
+    """按调用方传入的 API 地址派生配置（仓库不同就换 repo）。
+
+    ⚠️ 本函数的入参在旧版里就存在，旧实现据此推导 Release 元数据地址。
+       重构进共享内核后入参被无视、一律用 CFG.repo —— 等于**接口契约被悄悄改掉**：
+       调用方传了别的仓库地址，实际检查的还是配置里那个仓库，且没有任何提示。
+       这里显式兑现契约；URL 里解析不出仓库就沿用 CFG（不改变原有行为）。
+    """
+    repo = _repo_from_api_url(latest_api_url)
+    if not repo or repo.lower() == (CFG.repo or "").lower():
+        return CFG
+    cfg = copy.copy(CFG)            # 浅拷贝：只换 repo，其余配置原样沿用
+    cfg.repo = repo
+    return cfg
+
+
 def _release_meta_url(api_url=None):
-    return CFG.release_meta_url
+    return _cfg_for(api_url).release_meta_url
 
 
 def _server_meta_url(api_url=None):
@@ -244,7 +284,7 @@ def _server_meta_url(api_url=None):
 
 def fetch_latest_release(api_url=None, timeout=15):
     """走 GitHub API 取最新 Release（旧接口名，保留）。"""
-    info = _core.fetch_latest_release(CFG, timeout=timeout)
+    info = _core.fetch_latest_release(_cfg_for(api_url), timeout=timeout)
     return info.to_dict() if info else None
 
 
@@ -262,18 +302,22 @@ def fetch_update_info(latest_api_url=None, timeout=5, log_fn=None):
         except Exception:  # noqa: BLE001
             pass
 
-    for url, source in _meta_candidates():
+    cfg = _cfg_for(latest_api_url)
+    if cfg is not CFG:
+        _log("按调用方传入的地址检查仓库：%s" % cfg.repo)
+
+    for url, source in _core.meta_candidates(cfg):
         try:
             d = _http_json(url, timeout)
         except Exception:  # noqa: BLE001
             continue
-        info = _core._parse_update_json(CFG, d, source)
+        info = _core._parse_update_json(cfg, d, source)
         if info:
             _log("已从 %s 获取版本信息：v%s" % (source, info.version))
             return info.to_dict()
 
     try:
-        info = _core.fetch_latest_release(CFG, timeout=10)
+        info = _core.fetch_latest_release(cfg, timeout=10)
         if info:
             _log("已从 GitHub API 获取版本信息：v%s" % info.version)
             return info.to_dict()

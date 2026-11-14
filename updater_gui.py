@@ -154,12 +154,14 @@ class UpdateDialog(tk.Toplevel):
             txt.configure(state="disabled")
 
         # 「更新后是否删除旧版本文件」：默认勾选（= 保持旧行为）。
-        # 取消勾选时旧版本 exe 会保留在程序目录里（可用来回退）。
+        # 取消勾选时旧版本 exe 会保留在程序目录里，但**会被改名**成
+        # `xxx_旧版_<时间戳>.exe`（就地更新必须把正在运行的 exe 挪开腾位置），
+        # 所以文案里要写清楚「改名保留」，否则用户找不到「我明明选了保留」的那个文件。
         # 放在按钮**上方**：它是本次更新的前置选择，与「立即更新」同属一个决策区；
         # 放到按钮下面会紧贴窗口底边，看起来像按钮的副标题。
         self._keep_old = tk.BooleanVar(value=cleanup_old_default)
         ttk.Checkbutton(
-            frm, text="更新后自动删除旧版本文件（取消勾选则保留旧版，便于回退）",
+            frm, text="更新后自动删除旧版本文件（取消勾选则改名保留，可双击回退）",
             variable=self._keep_old,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -191,7 +193,8 @@ class UpdateDialog(tk.Toplevel):
             try:
                 self._log_fn("旧版本文件处理方式：%s"
                              % ("更新完成后自动删除" if cleanup_old
-                                else "保留旧版本文件（用户取消了勾选）"))
+                                else "保留 —— 旧版本会被改名为「<软件名>_旧版_<时间戳>.exe」"
+                                     "留在程序目录，双击它即可回退"))
             except Exception:  # noqa: BLE001
                 pass
         self._close()
