@@ -68,12 +68,14 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.15.1"
+VERSION = "2.16.0"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
 # 并发下载线程数：过小无提速、过大可能触发法院平台限流；4 是实测稳妥值
 MAX_WORKERS = 4
+# 顶栏高度（逻辑像素）。v2.16.0 由 60 收到 52：白底扁平后太高会显得空。
+HEADER_H = 52
 # 自动更新：GitHub 上最新 Release 信息（私有仓库需设为公开才能免密访问）
 GITHUB_API_LATEST = "https://api.github.com/repos/jianRY/dianzisongda-xiazaiqi/releases/latest"
 
@@ -985,12 +987,16 @@ class App:
         # 重设窗口大小，并明确告诉用户「重启后最准」，别让他对着畸大的窗口发懵。
         root.bind("<Configure>", self._on_root_configure, add="+")
 
-        # 顶部菜单栏
-        self._build_menubar()
-
-        # ── 顶栏：深蓝底 + 软件图标 + 标题/副标 ──
-        hd = tk.Canvas(root, height=K.u(60), highlightthickness=0, bd=0, bg=sk.bg)
-        hd.pack(fill="x")
+        # ── 顶栏：白底扁平 + 图标 + 标题 + 版本徽章 + 右上文字入口 ──
+        # v2.16.0 起不再用 Windows 原生菜单栏（它会压在顶栏上面，视觉上像多出一条
+        # 浅灰色带）；「使用说明 / 检查更新」提到顶栏，「导出诊断日志 / 关于」收进
+        # 使用说明窗口底部。功能一个没少，入口位置变了。
+        self._header = tk.Canvas(root, height=K.u(HEADER_H), highlightthickness=0,
+                                 bd=0, bg=sk.bg)
+        self._header.pack(fill="x")
+        self._hover_link = None          # 当前悬停的顶栏入口（重绘后据此恢复颜色）
+        # 鼠标移出顶栏时清掉手型光标：否则从按钮直接划出窗口，光标会一直停在 hand2
+        self._header.bind("<Leave>", lambda _e: self._set_header_cursor(False))
 
         # 真实软件图标（assets/app_icon_288.png，圆角透明底，随包发货）。
         # 引用必须挂在实例上，否则被 GC 回收后 Canvas 显示空白（缩放档同理，按 n 缓存）。
@@ -1000,40 +1006,11 @@ class App:
             self._logo_photo = tk.PhotoImage(file=resource_path(
                 os.path.join("assets", "app_icon_288.png")))
         except Exception:
-            self._logo_photo = None  # 资源缺失时回退到自绘金色方块
+            self._logo_photo = None  # 资源缺失时回退到自绘方块
 
-        def _paint_header(_e=None):
-            if not hd.winfo_exists():
-                return
-            hd.delete("all")
-            w, h = hd.winfo_width(), hd.winfo_height()
-            if w < 10:
-                return
-            K.rr(hd, 0, 0, w, h, 0, sk.header)
-            gx, gy, gs = K.u(18), K.u(12), K.u(36)
-            if self._logo_photo is not None:
-                # 288px 源图按 DPI 抽样到最接近 gs 的档位（整数倍 subsample）
-                n = max(1, min(12, round(288.0 / max(gs, 1))))
-                photo = self._logo_cache.get(n)
-                if photo is None:
-                    try:
-                        photo = self._logo_photo.subsample(n, n)
-                    except Exception:
-                        photo = self._logo_photo
-                    self._logo_cache[n] = photo
-                hd.create_image(gx + gs / 2.0, gy + gs / 2.0, image=photo)
-            else:
-                K.rr(hd, gx, gy, gx + gs, gy + gs, K.u(8), sk.gold)
-                for i, t in enumerate((0.36, 0.50, 0.64)):
-                    hd.create_line(gx + gs * 0.26, gy + gs * t,
-                                   gx + gs * (0.74 if i < 2 else 0.58), gy + gs * t,
-                                   fill=sk.header, width=K.u(2), capstyle="round")
-            hd.create_text(gx + gs + K.u(14), h / 2, text="法院文书下载器",
-                           font=K.f(14, True), fill="#FFFFFF", anchor="w")
-            hd.create_text(w - K.u(18), h / 2,
-                           text="法院文书下载器 v" + VERSION,
-                           font=K.f(9), fill=sk.header_text_dim, anchor="e")
-        hd.bind("<Configure>", _paint_header)
+        # ⚠️ bind 必须放在图标初始化**之后**：_paint_header 要读 _logo_photo，
+        # 绑定在前会让首次 Configure 有概率撞上「属性还不存在」。
+        self._header.bind("<Configure>", self._paint_header)
 
         # ── 卡1：① 粘贴区 ──
         c1 = K.Card(root, pad=12)
@@ -1464,21 +1441,122 @@ class App:
         except Exception:
             pass
 
-    # ---- 顶部菜单栏 ----
-    def _build_menubar(self):
-        menubar = tk.Menu(self.root)
-        # 更新菜单
-        m_update = tk.Menu(menubar, tearoff=0)
-        m_update.add_command(label="检查更新", command=self.check_update_manual)
-        menubar.add_cascade(label="更新", menu=m_update)
-        # 帮助菜单
-        m_help = tk.Menu(menubar, tearoff=0)
-        m_help.add_command(label="使用说明", command=self.show_help)
-        m_help.add_command(label="导出诊断日志（已脱敏）", command=self.export_diag_log)
-        m_help.add_separator()
-        m_help.add_command(label="关于", command=self.show_about)
-        menubar.add_cascade(label="帮助", menu=m_help)
-        self.root.config(menu=menubar)
+    # ---- 顶栏（自绘，替代原生菜单栏）----
+    def _set_header_cursor(self, on):
+        try:
+            self._header.configure(cursor=("hand2" if on else ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hover_header_link(self, item, key, on):
+        """顶栏文字入口的悬停态：变色 + 手型光标。"""
+        sk = K.SKIN
+        self._hover_link = key if on else None
+        try:
+            self._header.itemconfigure(
+                item, fill=(sk.accent if on else sk.header_link))
+        except Exception:  # noqa: BLE001
+            return
+        self._set_header_cursor(on)
+
+    def _add_header_link(self, cv, label, right, cy, command):
+        """在顶栏右侧画一个纯文字入口（无背景、无边框），返回它的左边界。
+
+        热区用一层**透明矩形**实现：Canvas 的 create_text 命中范围只有字形本身，
+        「使」「用」之间的空隙鼠标移过去就触发 <Leave> → 悬停色一闪一闪。
+        矩形与文字绑同一组回调，所以点哪里都算点中。
+
+        ⚠️ 返回左边界是为了让调用方「从右往左」排版：先画最右的「检查更新」，
+        再用它实测的左边界减间距排「使用说明」。宽度不写死，换字号/换 DPI 都不错位。
+        """
+        sk = K.SKIN
+        tid = cv.create_text(right, cy, text=label, font=K.f(10),
+                             fill=(sk.accent if self._hover_link == label
+                                   else sk.header_link), anchor="e")
+        bb = cv.bbox(tid)
+        left = bb[0] if bb else right - K.u(40)
+        pad_x, pad_y = K.u(6), K.u(5)
+        hid = cv.create_rectangle(left - pad_x, bb[1] - pad_y,
+                                  right + pad_x, bb[3] + pad_y,
+                                  fill="", outline="")
+        for iid in (tid, hid):
+            cv.tag_bind(iid, "<Enter>",
+                        lambda _e, t=tid, k=label: self._hover_header_link(t, k, True))
+            cv.tag_bind(iid, "<Leave>",
+                        lambda _e, t=tid, k=label: self._hover_header_link(t, k, False))
+            cv.tag_bind(iid, "<Button-1>", lambda _e, c=command: c())
+        return left
+
+    def _paint_header(self, _e=None):
+        """重画顶栏：白底 + 1px 分割线 + 图标 + 标题 + 版本徽章 + 右上文字入口。
+
+        ⚠️ 每次 <Configure> 都会全量重画，这里的 item 都是「画完即弃」。
+        唯一要跨重绘保留的状态是 self._hover_link —— 否则鼠标停在按钮上时
+        窗口一缩放，按钮颜色就跳回默认灰。
+        """
+        cv = getattr(self, "_header", None)
+        if cv is None or not cv.winfo_exists():
+            return
+        sk = K.SKIN
+        cv.delete("all")
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10:
+            return
+        # 底：纯白 + 底部 1 **物理**像素分割线。
+        # 这里故意写 1 而不是 K.u(1)：150% 缩放下 K.u(1) 会取整成 2、250% 下成 3，
+        # 比参考图那根细线粗一倍，视觉上变成「一条灰带」。
+        cv.create_rectangle(0, 0, w, h, fill=sk.header_bg, outline=sk.header_bg)
+        cv.create_rectangle(0, h - 1, w, h, fill=sk.header_line,
+                            outline=sk.header_line)
+
+        # 图标
+        gx, gs = K.u(20), K.u(28)
+        gy = (h - gs) / 2.0
+        if self._logo_photo is not None:
+            # 288px 源图按 DPI 抽样到最接近 gs 的档位（整数倍 subsample）
+            n = max(1, min(12, round(288.0 / max(gs, 1))))
+            photo = self._logo_cache.get(n)
+            if photo is None:
+                try:
+                    photo = self._logo_photo.subsample(n, n)
+                except Exception:  # noqa: BLE001
+                    photo = self._logo_photo
+                self._logo_cache[n] = photo   # 必须挂引用，否则下一帧就被 GC 掉
+            cv.create_image(gx + gs / 2.0, gy + gs / 2.0, image=photo)
+        else:
+            K.rr(cv, gx, gy, gx + gs, gy + gs, K.u(7), sk.gold)
+            for i, t in enumerate((0.36, 0.50, 0.64)):
+                cv.create_line(gx + gs * 0.26, gy + gs * t,
+                               gx + gs * (0.74 if i < 2 else 0.58), gy + gs * t,
+                               fill=sk.header_bg, width=K.u(2), capstyle="round")
+
+        # 标题
+        tx = gx + gs + K.u(15)
+        title_id = cv.create_text(tx, h / 2.0, text="法院文书下载器",
+                                  font=K.f(11, True), fill=sk.header_title,
+                                  anchor="w")
+
+        # 版本徽章：紧跟标题右侧 14px。宽度按文字实测而不是写死 58，
+        # 版本号从 v2.9.9 变 v2.10.10 时不会溢出。
+        badge_id = cv.create_text(0, 0, text="v" + VERSION, font=K.f(9),
+                                  fill=sk.badge_fg, anchor="w")
+        bb = cv.bbox(badge_id)
+        tw = (bb[2] - bb[0]) if bb else K.u(40)
+        bx = cv.bbox(title_id)[2] + K.u(14)
+        bh, by = K.u(22), (h - K.u(22)) / 2.0
+        bw = tw + 2 * K.u(10)
+        K.rr(cv, bx, by, bx + bw, by + bh, K.u(6), sk.badge_bg)
+        cv.coords(badge_id, bx + bw / 2.0, h / 2.0)
+        cv.itemconfigure(badge_id, anchor="center")
+        # ⚠️ 徽章底板是后画的，会盖在先画的文字上面 → 必须把文字提到最上层，
+        #    否则看到的是一个空白的浅蓝圆角块（这个坑当场踩过）。
+        cv.tag_raise(badge_id)
+
+        # 右上文字入口：右距 17、组距 16（从右往左依次排）
+        right = w - K.u(17)
+        for label, action in (("检查更新", self.check_update_manual),
+                              ("使用说明", self.show_help)):
+            right = self._add_header_link(cv, label, right, h / 2.0, action) - K.u(16)
 
     def show_help(self):
         """使用说明窗口。"""
@@ -1533,11 +1611,13 @@ class App:
             "————————— 自动更新 —————————\n"
             "· 程序启动时会自动检查更新，发现新版会弹窗显示本次更新内容。\n"
             "· 弹窗三选：立即更新 / 本次忽略 / 以后不再提醒。\n"
-            "  选「以后不再提醒」后启动不再自动检查（菜单里仍可手动检查）。\n"
+            "  选「以后不再提醒」后启动不再自动检查（顶栏「检查更新」仍可手动检查）。\n"
             "· 确认更新后显示下载进度与速度，可随时取消。\n"
-            "· 下载完成后新版本直接放进本程序所在文件夹，自动重启，\n"
-            "  并删掉旧版本文件；程序文件名保持不变，桌面快捷方式继续可用。\n"
+            "· 下载完成后新版本直接放到本程序所在位置，提示「更新完成」后本程序退出；\n"
+            "  重新打开程序即为新版本（不会自动帮你打开新窗口）。\n"
+            "  旧版本文件会在下次启动时清理，程序文件名保持不变，桌面快捷方式继续可用。\n"
             "  请把程序放在有写入权限的位置（如桌面），放在只读目录里无法自动更新。\n"
+            "· 更新失败时弹窗会直接给出官网与 Release 下载地址，可手动下载安装。\n"
             "· 本程序有两种版本，功能完全一致：绿色单文件版（免安装，放哪都能跑）\n"
             "  和安装版（会创建开始菜单/桌面快捷方式，可随时在系统「已安装的应用」里卸载）。\n\n"
             "————————— 常见问题 —————————\n"
@@ -1553,8 +1633,18 @@ class App:
         )
         txt.insert("1.0", content)
         txt.configure(state="disabled")
-        K.RoundButton(win, text="关闭", command=win.destroy, kind="ghost",
-                      height=32, font_size=9, width=72).pack(pady=(K.u(10), K.u(12)))
+        # 底部按钮行：v2.16.0 去掉原生菜单栏后，「导出诊断日志 / 关于」原本的两个
+        # 菜单位置没有了，收到这里 —— 比在顶栏再挤两个入口更省地方，也不打断主流程。
+        bar = tk.Frame(win, bg=sk.bg)
+        bar.pack(fill="x", padx=K.u(14), pady=(K.u(10), K.u(12)))
+        K.RoundButton(bar, text="关闭", command=win.destroy, kind="ghost",
+                      height=32, font_size=9, width=72).pack(side="right")
+        K.RoundButton(bar, text="关于", command=self.show_about, kind="ghost",
+                      height=32, font_size=9, width=72).pack(side="right",
+                                                             padx=(0, K.u(8)))
+        K.RoundButton(bar, text="导出诊断日志", command=self.export_diag_log,
+                      kind="ghost", height=32, font_size=9,
+                      width=112).pack(side="left")
 
     def export_diag_log(self):
         """把最近几天的日志脱敏后另存，供用户发给技术支持。
@@ -1606,7 +1696,7 @@ class App:
 
     # ---- 自动检查更新（通用模块 autoupdate 承担 UI 与下载） ----
     def check_update_manual(self):
-        """菜单/按钮手动检查：不受「以后不再提醒」开关影响。"""
+        """顶栏「检查更新」手动检查：不受「以后不再提醒」开关影响。"""
         autoupdate.run_update_check(
             self.root,
             app_name=APP_NAME,

@@ -94,9 +94,18 @@ class Skin:
     ok = "#15803D"
     warn = "#B45309"
     bad = "#B91C1C"
+    # 历史常量：v2.16.0 前顶栏是整条深蓝，这两项只服务于旧画法。
+    # 保留是因为外部脚本/预览稿可能引用，删掉会 ImportError/AttributeError。
     header = "#2E5DA8"
     header_text_dim = "#BBD0EE"
     gold = "#D9A441"
+    # v2.16.0 顶栏改白底扁平（对齐发票工具那套：白底 + 浅分割线 + 徽章 + 文字入口）
+    header_bg = "#FFFFFF"
+    header_line = "#E8EBF2"
+    header_title = "#1F2937"
+    header_link = "#6B7280"
+    badge_bg = "#EEF2FF"
+    badge_fg = "#1D4ED8"
     radius_card = 8
     radius_btn = 8
     btn_h = 46
