@@ -68,7 +68,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.16.0"
+VERSION = "2.16.1"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -920,7 +920,20 @@ def save_config(out_dir, auto_open_mode, convert_jpg, jpg_mode, auto_update=None
 
 
 def _open_in_explorer(path, log_fn, empty_msg=None):
-    """跨平台打开文件夹。empty_msg 在路径不存在时弹出提示。"""
+    """跨平台打开文件夹。empty_msg 在路径不存在时弹出提示。
+
+    ⚠️ 环境变量 `COURT_NO_SHELL=1` 时**只记一行日志、不真的调系统外壳**。
+    存在的理由：自动化测试会真的点「开始下载」并跑完整 worker 流程，最后按设置走到
+    这里 —— 不拦的话**每跑一次测试就弹一个资源管理器窗口**，还得人手去关；
+    用户在 v2.16.0 后反馈「测试打开了好多文件夹没关」就是这么来的。
+    以后新增会跑 worker 的测试，务必在**导入本模块之前**设置这个变量。
+    """
+    if os.environ.get("COURT_NO_SHELL"):
+        try:
+            log_fn("[测试] 已跳过打开文件夹：%s" % path)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if path and os.path.isdir(path):
         try:
             if sys.platform.startswith("win"):
