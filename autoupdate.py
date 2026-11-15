@@ -449,6 +449,44 @@ def send_to_recycle_bin(path=None):
     return _core.send_to_recycle_bin(path)
 
 
+def parked_versions(directory=None, current=None, app_name=None):
+    """列出程序目录里本程序的旧版文件（`*_旧版_<时间戳>.exe`）。"""
+    return _core.parked_versions(directory, current=current, app_name=app_name)
+
+
+def spawn_recycle_helper(path=None, log_fn=None):
+    """启动「本进程退出后把 path 送进回收站」的后台助手（薄包装）。"""
+    return _core.spawn_recycle_helper(path, log_fn)
+
+
+def recycle_in_helper(argv=None, timeout=600.0, retry_window=20.0, log_fn=None):
+    """（子进程侧）处理 `--recycle-old-file <路径> [--wait-pid <pid>]`。
+
+    ⚠️ 主程序必须在 main() **最开头**调用它：`handled=True` 时立刻返回，
+       这条路径不建窗口、不联网 —— 它只是「更新收尾」用的隐藏进程。
+    """
+    return _core.recycle_in_helper(argv, timeout=timeout,
+                                   retry_window=retry_window, log_fn=log_fn)
+
+
+RECYCLE_ARG = _core.RECYCLE_ARG
+WAIT_PID_ARG = _core.WAIT_PID_ARG
+
+
+def recycle_parked_versions(directory=None, current=None, app_name=None, log_fn=None,
+                            cleanup_old=True, recycle_fn=None, spawn_fn=None):
+    """更新完成时（弹「更新完成」之前）把旧版文件送进系统回收站。
+
+    ⚠️ `recycle_fn` 这里传的是**本模块的** send_to_recycle_bin（薄包装不是赋值），
+       宿主/测试 monkeypatch 本模块的名字才会生效 —— 与 _purge / _is_frozen 同理。
+    """
+    return _core.recycle_parked_versions(
+        directory, current=current, app_name=app_name, log_fn=log_fn,
+        cleanup_old=cleanup_old,
+        recycle_fn=recycle_fn or send_to_recycle_bin,
+        spawn_fn=spawn_fn)
+
+
 # 待改名状态：旧版是模块级变量，外部（含测试）会读写它。
 # ⚠️ 重构后状态住在共享内核里 ⇒ 用**状态代理**把本模块的读写直通过去，
 #    不能在这里留静态副本（那样外部读到的永远是 None，写复位也清不掉内核真状态）。

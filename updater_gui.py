@@ -181,6 +181,7 @@ class UpdateDialog(tk.Toplevel):
                 lb.bind("<Button-1>", lambda e, u=url: self._open_url(u))
 
         # 「更新后是否删除旧版本文件」：默认勾选（= 保持旧行为）。
+        # 勾选＝更新完成后把旧版 exe **移入系统回收站**（不是彻底删除，可还原）；
         # 取消勾选时旧版本 exe 会保留在程序目录里，但**会被改名**成
         # `xxx_旧版_<时间戳>.exe`（就地更新必须把正在运行的 exe 挪开腾位置），
         # 所以文案里要写清楚「改名保留」，否则用户找不到「我明明选了保留」的那个文件。
@@ -188,7 +189,8 @@ class UpdateDialog(tk.Toplevel):
         # 放到按钮下面会紧贴窗口底边，看起来像按钮的副标题。
         self._keep_old = tk.BooleanVar(value=cleanup_old_default)
         ttk.Checkbutton(
-            frm, text="更新后自动删除旧版本文件（取消勾选则改名保留，可双击回退）",
+            frm, text="更新完成后把旧版本文件移入系统回收站"
+                      "（取消勾选则改名保留在程序目录，可双击回退）",
             variable=self._keep_old,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -233,7 +235,7 @@ class UpdateDialog(tk.Toplevel):
         if self._log_fn:
             try:
                 self._log_fn("旧版本文件处理方式：%s"
-                             % ("更新完成后自动删除" if cleanup_old
+                             % ("移入系统回收站" if cleanup_old
                                 else "保留 —— 旧版本会被改名为「<软件名>_旧版_<时间戳>.exe」"
                                      "留在程序目录，双击它即可回退"))
             except Exception:  # noqa: BLE001
@@ -633,13 +635,15 @@ class DownloadProgressDialog(tk.Toplevel):
         if not auto_restart:
             # 不自动拉起时，必须**明确告诉用户「已更新、请重新打开」**：
             # 否则窗口里还是旧版界面，用户会以为更新根本没成功。
+            #
+            # ① 旧版文件就在**这里**送进回收站，不再等用户下次启动（2026-11-15 建哥要求）：
+            #    顺序固定为「先处理旧版、再弹提示」。反过来的话，提示里写着
+            #    「旧版已移入回收站」，而用户切到资源管理器一看两个 exe 还并排躺着——
+            #    界面说的和实际做的对不上，比不提示更糟。
+            disposal = self._dispose_old_versions()
             self._log("✓ 更新完成：新版本已就位（未自动启动，重新运行程序后生效）")
             try:
-                messagebox.showinfo(
-                    "更新完成",
-                    "更新已完成，新版本已安装到原位置。\n\n"
-                    "点「确定」后本程序会关闭，请重新打开「%s」即可使用新版本。"
-                    % (getattr(self, "_app_name", "") or "本程序"))
+                messagebox.showinfo("更新完成", self._done_text(disposal))
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -649,6 +653,72 @@ class DownloadProgressDialog(tk.Toplevel):
             pass
         # 本进程必须真正退出：既避免两个实例同时存在，也为了释放旧版文件的锁。
         self._exit_app(restart=auto_restart)
+
+    # ---- 更新完成时：旧版去哪了 ----
+    def _dispose_old_versions(self):
+        """把程序目录里的旧版文件送进系统回收站，返回内核给的处置结果。
+
+        ⚠️ 必须在**弹「更新完成」之前**调用 —— 提示要如实交代旧版的下落，
+           而「提示已弹出、旧版还躺在程序目录里」就是这个函数要消灭的窗口期。
+        ⚠️ 正在运行的 exe 删不掉自己，内核会把这一份登记给后台助手，
+           本进程退出后 0.3 秒内完成 —— 用户看到的结果和提示说的一致。
+        ⚠️ 只处理「本程序自己的旧版文件」（命名结构由内核把关），
+           同目录里别人的文件一律不碰。
+        """
+        info = {"cleanup_old": bool(getattr(self, "_cleanup_old", True)),
+                "found": [], "recycled": [], "scheduled": [], "failed": []}
+        try:
+            current = os.path.abspath(sys.executable)
+            directory = os.path.dirname(current)
+        except Exception:  # noqa: BLE001
+            return info
+        try:
+            res = core.recycle_parked_versions(
+                directory, current=current,
+                app_name=getattr(self, "_app_name", "") or None,
+                log_fn=self._log, cleanup_old=info["cleanup_old"])
+            if isinstance(res, dict):
+                info.update(res)
+        except Exception as e:  # noqa: BLE001
+            # 走到这里说明更新本身已经成功了，收尾出岔子绝不能把它说成「更新失败」
+            self._log("旧版本文件处理异常（不影响更新结果）：%s" % e)
+        return info
+
+    def _done_text(self, info=None):
+        """「更新完成」提示的正文。
+
+        三种情形都要说清楚旧版去哪了，不能让用户自己猜：
+          · 删除旧版 + 已进回收站 → 明确告知已移入回收站，并给出回退办法
+          · 删除旧版 + 暂时删不掉   → 说明「关闭后 / 下次启动」会清理，绝不说成已删
+          · 保留旧版（用户取消勾选）→ 写明保留成什么名字，双击即可回退
+        """
+        info = info or {}
+        app = getattr(self, "_app_name", "") or "本程序"
+        recycled = list(info.get("recycled") or [])
+        scheduled = list(info.get("scheduled") or [])
+        failed = list(info.get("failed") or [])
+        found = list(info.get("found") or [])
+        kept = found if not info.get("cleanup_old", True) else []
+
+        lines = ["更新已完成，新版本已安装到原位置。"]
+        if recycled or scheduled:
+            lines.append("")
+            lines.append("旧版本已移入系统回收站：")
+            lines += ["· %s" % n for n in (recycled + scheduled)]
+            lines.append("如需回退到旧版本，可在回收站中还原该文件后双击运行。")
+        elif kept:
+            lines.append("")
+            lines.append("按你的选择，旧版本已保留在程序目录：")
+            lines += ["· %s" % n for n in kept]
+            lines.append("需要回退时，双击上面的文件即可运行旧版本。")
+        if failed:
+            lines.append("")
+            lines.append("以下旧版本文件暂时没能删除（仍被占用），"
+                         "会在下次启动时自动清理：")
+            lines += ["· %s" % n for n in failed]
+        lines.append("")
+        lines.append("点「确定」后本程序会关闭，请重新打开「%s」即可使用新版本。" % app)
+        return "\n".join(lines)
 
     def _discard_partial(self, path):
         """删掉没下完的临时 exe。

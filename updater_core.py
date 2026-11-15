@@ -82,13 +82,14 @@ __all__ = [
     "write_cleanup_flag", "read_and_consume_cleanup_flag",
     "park_file", "apply_pending_rename", "settle_after_update",
     "windows_replace_and_restart", "launch_replaced_version",
-    "send_to_recycle_bin",
+    "send_to_recycle_bin", "parked_versions", "recycle_parked_versions",
+    "spawn_recycle_helper", "recycle_in_helper", "RECYCLE_ARG", "WAIT_PID_ARG",
     "load_auto_update", "save_auto_update", "load_cleanup_old", "save_cleanup_old",
     "load_auto_update_cfg", "save_auto_update_cfg",
 ]
 
 # 内核版本号：改动内核后 +1，同步脚本据此判断副本是否过期。
-CORE_VERSION = "1.2.0"
+CORE_VERSION = "1.3.0"
 
 # ---------------- 常量 ----------------
 UA = (
@@ -1387,7 +1388,7 @@ def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=No
     # 清理策略：调用方显式给了就用，没给就读旧版进程留下的标记文件（用户勾了什么）
     if cleanup_old is None:
         cleanup_old = read_and_consume_cleanup_flag(directory)
-    _log("旧版本文件处理方式：%s" % ("更新完成后自动删除"
+    _log("旧版本文件处理方式：%s" % ("移入系统回收站"
                                    if cleanup_old else
                                    "保留 —— 会被改名为「<软件名>_旧版_<时间戳>.exe」"
                                    "留在程序目录，可直接双击它回退到旧版"))
@@ -1461,6 +1462,7 @@ def _take_over_in_place(current, staging, directory, cleanup_old, log_fn):
         # 同一秒内重复更新会撞名；换毫秒后缀，绝不覆盖已有文件
         parked = os.path.join(
             directory, "%s_旧版_%d%s" % (pstem, int(time.time() * 1000), ext))
+    global _LAST_TAKEOVER
     moved_self = False
     try:
         if os.path.exists(current):
@@ -1473,6 +1475,7 @@ def _take_over_in_place(current, staging, directory, cleanup_old, log_fn):
             shutil.move(staging, current)
     except Exception as e:  # noqa: BLE001
         # 回滚：把旧版名字改回去，别让用户既没有新版、也没有能用的旧版
+        _LAST_TAKEOVER = ""
         if moved_self and os.path.exists(parked) and not os.path.exists(current):
             try:
                 os.rename(parked, current)
@@ -1482,6 +1485,8 @@ def _take_over_in_place(current, staging, directory, cleanup_old, log_fn):
             "新版本已下载完成，但替换程序文件失败（%s）。\n"
             "请手动把 %s 改名为 %s（先关掉本程序）"
             % (e, os.path.basename(staging), os.path.basename(current)))
+    # 新版已经站在原名上了 ⇒ 记下来：后面要再起一个自己做收尾（sys.executable 已失效）
+    _LAST_TAKEOVER = current
     if moved_self:
         try:
             log_fn("旧版本已改名为：%s（%s）"
@@ -1555,7 +1560,7 @@ def windows_replace_and_restart(new_exe_path, log_fn=None, cleanup_old=True,
     #    只能靠文件跨进程传递。必须在启动新版**之前**写好。
     if write_cleanup_flag(directory, cleanup_old):
         _log("旧版本文件处理方式已传给新版本：%s"
-             % ("更新完成后自动删除" if cleanup_old else "保留旧版本文件"))
+             % ("移入系统回收站" if cleanup_old else "保留旧版本文件"))
 
     # ②' 不自动启动：现在就完成「新版顶替原文件名」，本进程随后退出。
     if not restart:
@@ -1714,6 +1719,301 @@ def send_to_recycle_bin(path):
                 ctypes.windll.ole32.CoUninitialize()
             except Exception:
                 pass
+
+
+# --------------------------------------------------- 旧版文件送进回收站（1.3.0）
+# 背景（2026-11-15 建哥要求）：
+#   就地更新把旧版改名成 `xxx_旧版_<时间戳>.exe` 之后，一直是「等用户**下次打开
+#   新版本**」才由 cleanup_old_versions() 硬删掉。这中间用户看到的是「新旧两个 exe
+#   并排躺在程序目录里」，既分不清该点哪个，也怀疑更新到底成没成功。
+# 现在的约定：
+#   · 「更新完成」提示弹出的**同一步**里就把旧版送进系统回收站，不再等下次启动；
+#   · 走回收站而不是硬删 —— 新版万一有问题，用户能从回收站把旧版捞回来；
+#   · 正在运行的 exe **删不掉自己**（Windows 文件锁，改名可以、删除不行），
+#     所以「当场删不掉」的那一份交给一个立刻启动的后台小助手：它轮询到本进程
+#     退出后再动手，做完就静默退出，不弹窗、不占窗口、不碰其它文件。
+
+PARKED_TAG = "_旧版_"
+
+
+def _match_prefixes(current, app_name=None):
+    """列出「可能属于本程序」的基准名前缀（供 old_version_pattern_multi 用）。
+
+    更新后文件名会带版本号（`法院文书下载器_v2.17.0.exe`），改名留下的旧版
+    却是上一版的名字（`…_v2.16.1_旧版_….exe`）⇒ 只拿当前文件的基准名去匹配会漏。
+    app_name、当前基准名、去掉 `_vX.Y.Z` 的基准名三条一起给，既能全收、又因为
+    结构必须精确（前缀 + 可选 _v版本 + _旧版 + 扩展名）不会误伤同目录别家文件。
+    """
+    stem = os.path.splitext(os.path.basename(current or ""))[0]
+    cands = [app_name or "", base_stem(stem), re.sub(r"_v[\d.]+$", "", base_stem(stem))]
+    out = []
+    for c in cands:
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def parked_versions(directory, current=None, app_name=None):
+    """列出程序目录里本程序的「旧版」文件（`*_旧版_<时间戳>.exe`，排除 current）。
+
+    只认本程序自己的命名结构（复用 old_version_pattern_multi），
+    且要求文件名里带 `_旧版_`（`_更新中` 那些半成品不算「旧版本」，不往回收站送）。
+    """
+    directory = directory or "."
+    ext = os.path.splitext(current or "")[1] or ".exe"
+    prefixes = _match_prefixes(current, app_name)
+    if not prefixes:
+        return []
+    pat = old_version_pattern_multi(prefixes, ext)
+    cur = os.path.abspath(current).lower() if current else ""
+    found = []
+    try:
+        for name in os.listdir(directory):
+            if PARKED_TAG not in name or not pat.match(name):
+                continue
+            full = os.path.join(directory, name)
+            if cur and os.path.abspath(full).lower() == cur:
+                continue
+            if os.path.isfile(full):
+                found.append(full)
+    except OSError:
+        pass
+    return sorted(found)
+
+
+RECYCLE_ARG = "--recycle-old-file"      # 子进程侧：把指定文件移进回收站
+WAIT_PID_ARG = "--wait-pid"              # 子进程侧：先等这个 pid 退出再动手
+
+
+def _detached_child_env():
+    """给「另起一个本程序」用的干净环境变量。
+
+    ⚠️⚠️ PyInstaller 6.x 的坑（与 launch_replaced_version 里同一条）：
+      子进程会**复用父进程的 %TEMP%\\_MEIxxxx 解包目录**，父进程一退出就把它删了，
+      子进程随后「还活着但一用资源就崩」。必须重置环境并清掉 _PYI_* / _MEIPASS。
+    """
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for k in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
+              "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS", "_MEIPASS2"):
+        env.pop(k, None)
+    return env
+
+
+def _wait_pid_exit(pid, timeout=600.0):
+    """等指定进程退出（最多 timeout 秒）。返回 True = 确认已退出。
+
+    用内核对象 WaitForSingleObject 阻塞等待：零轮询、零 CPU。
+    拿不到句柄（pid 已消失 / 权限不足）时返回 False，调用方走重试兜底。
+    """
+    if sys.platform != "win32" or not pid:
+        return False
+    try:
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not h:
+            return False
+        try:
+            return ctypes.windll.kernel32.WaitForSingleObject(
+                h, int(max(0.0, timeout) * 1000)) == 0
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# 就地更新完成后「新版所在的那个路径」。
+# ⚠️ 必须记下来：`_take_over_in_place` 会先把正在运行的旧 exe 改名（sys.executable
+#    那条路径随后就不存在了），再把新版挪到原名。之后若要**再起一个自己**
+#    （收尾助手就干这事），只能认这个名字，不能用 sys.executable。
+_LAST_TAKEOVER = ""
+
+
+def recycle_in_helper(argv=None, timeout=600.0, retry_window=20.0, log_fn=None):
+    """（**子进程侧**）处理 `--recycle-old-file <路径> [--wait-pid <pid>]`。
+
+    宿主必须在 main() 最开头调用它，`handled=True` 时**立刻返回**：这条路径
+    不建窗口、不联网、不读配置，唯一任务就是等父进程退出后把旧版 exe 送进回收站。
+
+    返回 {"handled": 是否本次请求, "ok": 是否已达成, "path": 文件, "reason": 说明}。
+
+    ⚠️ 为什么由「另一个自己」来做，而不是当场删：Windows 不允许进程删除自己正在
+       运行的映像文件（改名可以、删除不行）。父进程退出后锁才释放，所以必须有个
+       活到那之后的执行者 —— 用同一个 exe 再起一个进程最省事，也复用已验证的
+       send_to_recycle_bin（纯 ctypes，不需要 PowerShell / .NET / 任何脚本宿主）。
+    """
+    argv = list(sys.argv if argv is None else argv)
+    out = {"handled": False, "ok": False, "path": "", "reason": ""}
+    if RECYCLE_ARG not in argv:
+        return out
+    out["handled"] = True
+
+    def _log(m):
+        try:
+            if log_fn:
+                log_fn(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        path = argv[argv.index(RECYCLE_ARG) + 1]
+    except (ValueError, IndexError):
+        out["reason"] = "缺少文件路径"
+        return out
+    out["path"] = path
+
+    pid = 0
+    if WAIT_PID_ARG in argv:
+        try:
+            pid = int(argv[argv.index(WAIT_PID_ARG) + 1])
+        except (ValueError, IndexError):
+            pid = 0
+    if pid:
+        _log("回收助手：等待主进程 %d 退出" % pid)
+        _wait_pid_exit(pid, timeout=timeout)
+
+    # 父进程的 onefile 引导器可能比真正的主进程晚一点退出 ⇒ 允许一小段重试
+    deadline = time.time() + max(0.0, retry_window)
+    while True:
+        if not os.path.exists(path):
+            out.update(ok=True, reason="文件已不在（无需处理）")
+            return out
+        try:
+            send_to_recycle_bin(path)
+        except Exception as e:  # noqa: BLE001
+            out["reason"] = str(e)
+        if not os.path.exists(path):
+            out.update(ok=True, reason="已移入系统回收站")
+            _log("回收助手：%s" % out["reason"])
+            return out
+        if time.time() >= deadline:
+            out["reason"] = out["reason"] or "文件仍被占用"
+            _log("回收助手：未能移入回收站（%s）" % out["reason"])
+            return out
+        time.sleep(0.4)
+
+
+def spawn_recycle_helper(path, log_fn=None):
+    """启动「本进程退出后把 path 送进回收站」的后台助手。成功返回 True。
+
+    做法＝**再起一个本程序**（同一个 exe），带 `--recycle-old-file <路径>
+    --wait-pid <本进程 pid>`；宿主在 main() 最开头看到这个参数只做回收就退出，
+    用户看不到任何窗口。
+
+    为什么不用 powershell / vbs 这类脚本：① 脚本里要进回收站得 Add-Type 加载
+    .NET 再调 FileIO，杀软对「脚本 + 删文件」的组合极其敏感（本机安全策略就
+    直接把 Add-Type 拦了）；② 部分机器禁脚本宿主或限执行策略；③ 本程序已经有
+    一份调通过的 ctypes 实现（send_to_recycle_bin），复用最稳，也不用担心中文
+    路径的转义与代码页。
+
+    ⚠️ 只在 Windows + 打包运行（或显式 `UPD_RECYCLE_FORCE=1`）时真正启动 ——
+       开发态跑脚本绝不能留下后台进程（与「测试乱开资源管理器」同一类污染）。
+    ⚠️ `CREATE_BREAKAWAY_FROM_JOB`：宿主若跑在「关闭即杀子进程」的作业对象里，
+       不带这个标志助手会被一起杀掉 ⇒ 旧版永远留在目录里。作业不允许 breakaway
+       时会抛错，所以先试带标志、失败再退回只带 NO_WINDOW。
+    ⚠️ 参数走 argv 列表，**不拼命令行字符串**：中文、空格、引号全不用管。
+    """
+    if sys.platform != "win32" or not path:
+        return False
+    if not (is_frozen() or os.environ.get("UPD_RECYCLE_FORCE") == "1"):
+        return False
+
+    exe = sys.executable
+    if not os.path.exists(exe):
+        # 就地更新后旧名字已被改名 ⇒ sys.executable 那条路径已经不存在。
+        # 只能改用「刚被顶到原文件名的新版」（见 _LAST_TAKEOVER 的说明）。
+        exe = _LAST_TAKEOVER if _LAST_TAKEOVER and os.path.exists(_LAST_TAKEOVER) else ""
+        if not exe:
+            try:
+                if log_fn:
+                    log_fn("找不到可用的程序本体，旧版本文件将在下次启动时清理")
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+    cmd = [exe, RECYCLE_ARG, path, WAIT_PID_ARG, str(os.getpid())]
+    base = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=_detached_child_env(),
+                cwd=os.path.dirname(exe) or None, close_fds=True)
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+    for flags in (CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW):
+        try:
+            subprocess.Popen(cmd, creationflags=flags, **base)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        if log_fn:
+            log_fn("后台回收助手启动失败，旧版本文件将在下次启动时清理")
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def recycle_parked_versions(directory, current=None, app_name=None, log_fn=None,
+                            cleanup_old=True, recycle_fn=None, spawn_fn=None):
+    """更新完成时（弹「更新完成」之前）调用：把旧版文件送进系统回收站。
+
+    cleanup_old=False（用户在更新弹窗里取消勾选「删除旧版」）→ 一个都不动，
+    只如实报出保留了哪些文件（提示里要写明名字，否则用户找不到「我要留的那份」）。
+
+    recycle_fn / spawn_fn: 可注入的依赖点（理由同 settle_after_update 的 purge_fn）：
+        适配层/测试要能替换「删除到回收站」和「启动后台助手」这两个动作，
+        否则测试会往用户真实的回收站里丢垃圾、或真的拉起 powershell。
+
+    返回 dict（提示文案直接用它，避免「界面说的」和「实际做的」对不上）：
+        found     目录里找到的旧版文件（名字）
+        recycled  当场就进了回收站（没被占用）
+        scheduled 仍被占用（典型＝正在运行的自己）→ 已交给后台助手，退出后完成
+        failed    连助手都起不来 → 只能留给下次启动清理（如实告知，不许说成已删）
+    """
+    log = log_fn
+    _recycle = recycle_fn or send_to_recycle_bin
+    _spawn = spawn_fn if spawn_fn is not None else spawn_recycle_helper
+    res = {"found": [], "recycled": [], "scheduled": [], "failed": []}
+
+    def _log(m):
+        try:
+            if log:
+                log(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+    paths = parked_versions(directory, current=current, app_name=app_name)
+    res["found"] = [os.path.basename(p) for p in paths]
+    if not res["found"]:
+        return res
+    if not cleanup_old:
+        _log("按你的选择保留旧版本文件（未移入回收站）：%s" % "、".join(res["found"]))
+        return res
+
+    for p in paths:
+        name = os.path.basename(p)
+        ok = False
+        try:
+            ok = bool(_recycle(p))
+        except Exception:  # noqa: BLE001
+            ok = False
+        if ok and not os.path.exists(p):
+            res["recycled"].append(name)
+            continue
+        # 删不掉 = 十有八九就是「正在运行的自己」（Windows 不允许删映像文件）
+        try:
+            scheduled = bool(_spawn(p, log_fn))
+        except Exception:  # noqa: BLE001
+            scheduled = False
+        (res["scheduled"] if scheduled else res["failed"]).append(name)
+
+    if res["recycled"]:
+        _log("旧版本已移入系统回收站：%s" % "、".join(res["recycled"]))
+    if res["scheduled"]:
+        _log("旧版本正被本次运行占用，已安排在本程序退出后移入系统回收站：%s"
+             % "、".join(res["scheduled"]))
+    if res["failed"]:
+        _log("旧版本暂时无法移入回收站（本程序关闭后若仍存在，会在下次启动时清理）：%s"
+             % "、".join(res["failed"]))
+    return res
 
 
 def make_temp_exe_path(app_name):

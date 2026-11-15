@@ -68,7 +68,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.16.1"
+VERSION = "2.17.0"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -2132,6 +2132,24 @@ class App:
 
 
 def main():
+    # 「更新收尾助手」入口：更新完成后由上一版进程用 `--recycle-old-file <路径>`
+    # 把本程序再起一个进程（本机 Windows 不允许进程删除自己正在运行的映像，
+    # 所以旧版 exe 只能等退出后再由别人收走）。
+    # ⚠️ 必须放在**最前面**：这条路径不建窗口、不联网、不读配置、不写日志抬头，
+    #    处理完立刻返回，用户只会看到「更新完成的提示」而看不到第二个窗口。
+    try:
+        _helper = autoupdate.recycle_in_helper()
+        if _helper.get("handled"):
+            try:
+                write_log_file("更新收尾助手：%s（%s）"
+                               % (_helper.get("reason") or "无说明",
+                                  os.path.basename(_helper.get("path") or "")))
+            except Exception:  # noqa: BLE001
+                pass
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
     setup_app_id()
     # 启动时清掉过期日志：日志里可能留着历史案件信息，不能无限期堆着
     prune_logs(30)
