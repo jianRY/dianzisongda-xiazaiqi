@@ -181,13 +181,27 @@ class Card(tk.Canvas):
             self.itemconfigure(self._win, width=w)
         self._paint(e.width, e.height)
 
+    def repaint(self):
+        """按**当前** DPI 比例重画背景（不移动 body，不重建控件）。
+
+        ⚠️ 只用于「显示器缩放变了」这种场景：已建控件的像素尺寸改不了，
+           但圆角半径、线宽这类纯绘制参数可以按新比例重算，否则边框会与
+           内容错开 1~2 像素，露出一小截多余细线。
+        """
+        if not self.winfo_exists():
+            return
+        self.radius = u(SKIN.radius_card)
+        self._paint(self.winfo_width(), self.winfo_height())
+
     def _paint(self, w, h):
         if not self.winfo_exists():
             return
         self.delete("cardbg")
         if w < 4 or h < 4:
             return
-        rr_border(self, 0, 0, w - 1, h - 1, self.radius, SKIN.border,
+        # 半径按**当前** SCALE 现算，别用构造时缓存的值：换显示器后旧值会让
+        # 圆角与边框对不上（视觉上就是「多出来一条线」）。
+        rr_border(self, 0, 0, w - 1, h - 1, u(SKIN.radius_card), SKIN.border,
                   SKIN.card, ("cardbg",))
         self.tag_lower("cardbg")
 
@@ -262,6 +276,10 @@ class RoundButton(tk.Canvas):
             self.create_text(cx, cy, text=self.text, font=f(self.font_size, True),
                              fill=fg)
 
+    def repaint(self):
+        """按当前 DPI 比例重画（换显示器/改缩放后调用）。"""
+        self._draw()
+
     def _enter(self, _e):
         self._hover = True
         self._draw()
@@ -294,6 +312,10 @@ class RoundCheck(tk.Canvas):
         self.bind("<Destroy>", self._on_destroy)
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Button-1>", self._toggle)
+
+    def repaint(self):
+        """按当前 DPI 比例重画（方块尺寸跟随控件实际高度，不做重排）。"""
+        self._draw()
 
     def _on_var(self, *_):
         self._draw()
@@ -348,6 +370,10 @@ class SegmentedControl(tk.Canvas):
                          height=u(height), width=u(width or 180), cursor="hand2")
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Button-1>", self._click)
+
+    def repaint(self):
+        """按当前 DPI 比例重画（圆角/文字间距随新比例，控件尺寸不动）。"""
+        self._draw()
 
     def set_value(self, key):
         self.value = key
@@ -413,6 +439,10 @@ class RoundProgress(tk.Canvas):
         self._value = 0.0
         self._stopped = False
         self.bind("<Configure>", lambda e: self._draw())
+
+    def repaint(self):
+        """按当前 DPI 比例重画（轨道圆角取控件实际高度，已填充部分保持不变）。"""
+        self._draw()
 
     def set_value(self, pct, stopped=False):
         try:

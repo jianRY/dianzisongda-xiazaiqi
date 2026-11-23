@@ -68,7 +68,7 @@ RETRY_BACKOFF = 2.0
 # ⚠️ 这个常量必须和发版参数严格一致。v2.10.1 就因为只改了产物名和 CHANGELOG、
 #    忘了改这里，导致用户每次启动都弹「发现新版本 v2.10.1」→ 点了更新装回
 #    v2.10.1 → 重启又弹 —— 永远升不掉。发版脚本 release_all.py 现在会强制校验它。
-VERSION = "2.17.0"
+VERSION = "2.17.1"
 # 软件名（唯一来源）：用于窗口标题、更新弹窗、以及**更新后的文件名**
 # （绿色版会被改名为「法院文书下载器_v2.7.exe」；安装版保持固定名「法院文书下载器.exe」）
 APP_NAME = "法院文书下载器"
@@ -1237,8 +1237,52 @@ class App:
             self.root.geometry("%dx%d" % (K.u(w), K.u(h)))
         except Exception:  # noqa: BLE001
             pass
+        # ⚠️ 光改窗口尺寸不够：新旧比例换算出来的物理尺寸有可能一样，那样
+        #    <Configure> 根本不触发，Canvas 上的圆角 / 分割线就停在旧 DPI 上，
+        #    与文字错开 1~2 像素 —— 视觉上就是「某处多出一条不该有的细线」。
+        #    所以这里主动重绘一遍；geometry 生效是异步的，落定后再补一次。
+        self._repaint_self_drawn()
+        try:
+            self.root.after(120, self._repaint_self_drawn)
+        except Exception:  # noqa: BLE001
+            pass
         self.log_msg("⚠ 检测到显示器缩放变化（当前 %d%%）—— 已按新比例调整窗口；"
                      "重启程序后界面尺寸最准确" % round(K.SCALE * 100))
+
+    def _repaint_self_drawn(self):
+        """按**当前** DPI 比例重画所有自绘 Canvas（顶栏 + 卡片 + 按钮 + 进度条）。
+
+        ⚠️ 为什么必须显式做：Canvas 图元的像素是按画的那一刻的 SCALE 算出来的，
+           Tk 不会因为 DPI 变了就自动重算。换显示器后如果窗口物理尺寸恰好没变，
+           <Configure> 不触发 ⇒ 图元与文字/控件错开，边缘露出一截多余细线。
+           这里只重画图元，**不重建控件、不动布局**，因此是安全的。
+        ⚠️ 标准 tkinter / ttk 控件不在此列：它们由 Tk 自己绘制，不存在这个错位。
+        ⚠️ 幂等：重复调用只是 delete + 重画，无副作用（geometry 生效是异步的，
+           所以调用方会在 120ms 后再补一次）。
+        """
+        try:
+            self._paint_header()
+        except Exception:  # noqa: BLE001
+            pass
+
+        def walk(w):
+            for c in w.winfo_children():
+                fn = getattr(c, "repaint", None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+                walk(c)
+
+        try:
+            walk(self.root)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.root.update_idletasks()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _settle_after_update(self):
         """更新后首次启动：登记「退出时把文件改成软件名_v实际版本号」+ 清理旧版文件。
